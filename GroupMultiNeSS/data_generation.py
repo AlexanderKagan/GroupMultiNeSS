@@ -6,6 +6,39 @@ from .utils import sigmoid, generate_matrices_given_pairwise_max_cosines
 
 
 class LatentPositionGenerator:
+    """
+    Generator of latent positions for MultiNeSS model.
+
+    This class simulates multiple network layers that share a common latent component and
+    layer-specific deviations. It supports normal and Bernoulli edge generation models
+    and can impose angle constraints between latent spaces.
+
+    Parameters
+    ----------
+    n_nodes : int
+        Number of nodes in each network layer.
+    n_layers : int
+        Number of network layers to generate.
+    edge_distrib : {'normal', 'bernoulli'}, default='normal'
+        Type of edge distribution. If 'normal', edges are generated with Gaussian noise.
+        If 'bernoulli', edges are drawn as Bernoulli random variables.
+    noise_sigma : float, default=1.0
+        Standard deviation of the Gaussian noise for normal-distributed edges.
+    loops_allowed : bool, default=True
+        Whether self-loops (diagonal entries) are allowed.
+    d_shared : int, default=2
+        Dimension of the shared latent space component.
+    d_individs : int or list of int, default=2
+        Dimension(s) of the individual latent spaces for each layer.
+    s_vu : float, default=0.0
+        Target cosine similarity between shared and individual latent components.
+    s_uu : float, default=0.0
+        Target cosine similarity among individual latent components.
+    comps_max_cosine_mat : np.ndarray, optional
+        Custom cosine similarity matrix between components.
+    min_V_max_U_eigval_ratio : float, optional
+        Ratio to scale individual latent components relative to the shared component.
+    """
     def __init__(self, n_nodes, n_layers, *,
                  edge_distrib: str = "normal",
                  noise_sigma: float = 1.,
@@ -110,6 +143,36 @@ class LatentPositionGenerator:
 
 
 class GroupLatentPositionGenerator(LatentPositionGenerator):
+    """
+    Generator of latent positions for GroupMultiNeSS model.
+
+    Parameters
+    ----------
+    n_nodes : int
+        Number of nodes in each network layer.
+    n_layers : int
+        Number of network layers to generate.
+    group_indices : list of int
+        Group index for each layer, specifying which group latent component applies.
+    edge_distrib : {'normal', 'bernoulli'}, default='normal'
+        Type of edge distribution for generated networks.
+    noise_sigma : float, default=1.0
+        Standard deviation of Gaussian noise for normal-distributed edges.
+    loops_allowed : bool, default=True
+        Whether self-loops (diagonal entries) are allowed.
+    d_shared : int, default=2
+        Dimension of the shared latent space component.
+    d_individs : int or list of int, default=2
+        Dimension(s) of individual latent spaces for each layer.
+    d_groups : int or list of int, default=2
+        Dimension(s) of group-specific latent spaces.
+    s_vw, s_vu, s_ww, s_wu, s_uu : float, default=0.0
+        Target cosine similarities among shared, group, and individual components.
+    comps_max_cosine_mat : np.ndarray, optional
+        Predefined cosine similarity matrix among all latent components.
+    min_V_max_W_eigval_ratio : float, optional
+        Ratio to scale group latent spaces relative to the shared component.
+    """
     def __init__(self, n_nodes: int, n_layers: int,  *,
                  group_indices: List[int],
                  edge_distrib: str = "normal",

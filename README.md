@@ -1,10 +1,10 @@
 # GroupMultiNeSS
 
-GroupMultiNeSS is a package for statistical modeling of multilayer networks. It implements multiple approaches allowing to extract shared, group, and individual latent structures from a collection of networks on a shared set of nodes. Specifically, it contains the implementation of fitting sampling procedures for the following models:
+GroupMultiNeSS is a package for statistical modeling of multilayer networks. It implements multiple approaches allowing to extract shared, group, and individual latent structures from a collection of networks on a shared set of nodes. Specifically, it contains the implementation of fitting and sampling procedures for the following models:
 - GroupMultiNeSS [Kagan et al. (2025)] - likelihood based approach with nuclear norm penalization, accounts for the additional group latent structure
 - MultiNeSS [[MacDonald et al. (2021)](https://arxiv.org/abs/2012.14409)] - likelihood based approach with nuclear norm penalization
 - MultiNeSS [[Tian et al. (2024)](https://arxiv.org/abs/2412.02151)] - likelihood based approach with pre-estimation of latent ranks via Shared Space Hunting algorithm
-- COSIE ([Arroyo et al.](https://arxiv.org/abs/1906.10026)) - spectral-based Multiple Adjacency Spectral Embedding algorithm
+- COSIE [[Arroyo et al. (2020)](https://arxiv.org/abs/1906.10026)] - spectral-based Multiple Adjacency Spectral Embedding algorithm
 
 ## Installation
 
@@ -47,7 +47,7 @@ print(group_multiness.make_final_error_report(S_true, Qs_true, Rs_true, Ps=Ps_tr
 
 MIT License
 
-Copyright (c) 2024 Alexander Kagan
+Copyright (c) 2025 Alexander Kagan
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
