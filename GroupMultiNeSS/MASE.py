@@ -1,6 +1,7 @@
 import numpy as np
 from typing import List
-from utils import truncated_svd, truncated_eigen_decomposition
+
+from .utils import truncated_svd, truncated_eigen_decomposition
 
 
 def MASE(As: np.array, d_shared: int, d_individs: List[int]):
