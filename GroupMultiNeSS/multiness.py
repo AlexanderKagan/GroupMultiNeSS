@@ -6,11 +6,11 @@ import seaborn as sns
 from multiprocessing import Manager
 from copy import deepcopy
 from itertools import product
-from utils import MultipleNetworkTrainTestSplitter
 from more_itertools import zip_equal
 
 from .utils import soft_thresholding_operator, hard_thresholding_operator, make_error_report, \
-    mean_frobenius_error, EarlyStopper, if_scalar_or_given_length_array, fill_diagonals
+    mean_frobenius_error, EarlyStopper, if_scalar_or_given_length_array, fill_diagonals, \
+    MultipleNetworkTrainTestSplitter
 from .base import BaseMultiplexNetworksModel, BaseRefitting, SharedMemoryMatrixFitter
 from .MASE import ASE
 
