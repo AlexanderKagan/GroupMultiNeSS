@@ -1,7 +1,10 @@
 # GroupMultiNeSS
 
-GroupMultiNeSS is a package for statistical modeling of multilayer networks. It implements multiple approaches allowing to extract shared, group, and individual latent structures from a collection of networks on a shared set of nodes. Specifically, it contains fitting procedures for the GroupMultiNeSS, MultiNeSS ([MacDonald et al. (2021)](https://arxiv.org/abs/2012.14409) and [Tian et al. (2024)](https://arxiv.org/abs/2412.02151)), and COSIE [Arroyo et al.] (https://arxiv.org/abs/1906.10026) models.
-
+GroupMultiNeSS is a package for statistical modeling of multilayer networks. It implements multiple approaches allowing to extract shared, group, and individual latent structures from a collection of networks on a shared set of nodes. Specifically, it contains the implementation of fitting sampling procedures for the following models:
+- GroupMultiNeSS [Kagan et al. (2025)] - likelihood based approach with nuclear norm penalization, accounts for the additional group latent structure
+- MultiNeSS [[MacDonald et al. (2021)](https://arxiv.org/abs/2012.14409)] - likelihood based approach with nuclear norm penalization
+- MultiNeSS [[Tian et al. (2024)](https://arxiv.org/abs/2412.02151)] - likelihood based approach with pre-estimation of latent ranks via Shared Space Hunting algorithm
+- COSIE ([Arroyo et al.](https://arxiv.org/abs/1906.10026)) - spectral-based Multiple Adjacency Spectral Embedding algorithm
 
 ## Installation
 
@@ -22,22 +25,21 @@ from GroupMultiNeSS.utils import make_group_indices
 
 
 # Sample true latent positions and group indices
-n = 200
-M = 16
-K = 4
-
+n, M, K = 200, 16, 4
 group_props = np.ones(K) / K  # make ballanced groups
 group_indices = make_group_indices(group_props, M)
 
-lpg = GroupLatentPositionGenerator(n_nodes=n, n_layers=M, group_indices=group_indices, edge_distrib="normal")
+lpg = GroupLatentPositionGenerator(n_nodes=n, n_layers=M, group_indices=group_indices)
 lpg.generate(random_seed=1)
+
 As, Ps_true, S_true, Qs_true, Rs_true = lpg.As, lpg.Ps, lpg.S, lpg.Qs, lpg.Rs
 
 # Fit GroupMultiNeSS model and compute the relative errors with ground-truth
 group_multiness = GroupMultiNeSS(group_indices, n_jobs=K)
 group_multiness.fit(As, lr=0.8)
 print(group_multiness.make_final_error_report(S_true, Qs_true, Rs_true, Ps=Ps_true))
-{'Shared component': 0.026, 'Group components': 0.051, 'Individual components': 0.122, 'Ps': 0.077} 
+
+# {'Shared component': 0.026, 'Group components': 0.051, 'Individual components': 0.122, 'Ps': 0.077}
 ```
 
 
