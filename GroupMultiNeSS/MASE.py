@@ -43,7 +43,8 @@ def MASE(As: np.array, d_shared: int, d_individs: List[int]):
     return ps, u_joint, rs
 
 
-def ASE(A: np.array, d: int, check_if_symmetric=True):
+def ASE(A: np.array, d: int, check_if_symmetric: bool = True,
+        indef_inner_prod: bool = True, return_signature=False):
     """
     Compute the Adjacency Spectral Embedding (ASE) of a symmetric adjacency matrix.
 
@@ -55,6 +56,11 @@ def ASE(A: np.array, d: int, check_if_symmetric=True):
         Embedding dimension.
     check_if_symmetric : bool, optional
         Whether to check symmetry of A. Default is True.
+    indef_inner_prod: bool, optional
+        If True, indefinite inner product with signature (p, d - p)  is assumed (GRDPG model).
+        If False, standard inner product is assumed (RDPG model)
+    return_signature: bool, optional
+        Whether to return_signature of the inner product. Only used when indef_inner_prod is TrueDefault is False.
 
     Returns
     -------
@@ -68,6 +74,14 @@ def ASE(A: np.array, d: int, check_if_symmetric=True):
     """
     if check_if_symmetric:
         assert np.allclose(A, A.T), "A should be a symmetric matrix"
-    eigvecs, eigvals, _ = truncated_svd(A, max_rank=d)
-    eigvals = np.sqrt(eigvals)
-    return eigvecs @ np.diag(eigvals)
+    eigvals, eigvecs = truncated_eigen_decomposition(A, max_rank=d, which="LM" if indef_inner_prod else "LA")
+    if indef_inner_prod:
+        sort_idx = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[sort_idx]
+        eigvecs = eigvecs[:, :sort_idx]
+        signature = np.where(eigvals > 0, 1., -1)
+        ase = eigvecs @ np.diag(np.sqrt(np.abs(eigvals)))
+        return (ase, signature) if return_signature else ase
+    else:
+        ase = eigvecs @ np.diag(np.sqrt(np.clip(eigvals, a_min=0, a_max=None)))
+        return ase

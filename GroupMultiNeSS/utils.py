@@ -1,8 +1,8 @@
 import numpy as np
-from scipy.sparse.linalg import svds
+from scipy.sparse.linalg import svds, eigsh
 from typing import List, Union, Tuple
 from copy import copy
-from scipy.sparse.linalg import eigsh
+from scipy.linalg import sqrtm
 from sklearn.model_selection import KFold
 
 
@@ -197,18 +197,13 @@ def soft_thresholding_operator(A, threshold, max_rank=None):
     return u @ np.diag(s) @ vt
 
 
-def matrix_power(A: np.array, p: Union[int, float], eps=1e-8):
-    if isinstance(p, int):
-        return np.linalg.matrix_power(A, p)
-    u, s, vt = np.linalg.svd(A)
-    assert np.all(s > eps), "float powers defined only for matrices with all positive singular values"
-    return u @ np.diag(s ** p) @ vt
-
-
 def frobenius_error(A_true, A_pred, relative=False, include_offdiag=True):
     assert A_true.shape == A_pred.shape
     assert A_true.ndim <= 2
-    mask = np.ones(A_true.shape, dtype=bool) if include_offdiag else ~np.eye(A_true.shape[0], dtype=bool)
+    if include_offdiag or A_true.ndim == 1:
+        mask = np.ones(A_true.shape, dtype=bool)
+    else:
+        mask = ~np.eye(A_true.shape[0], dtype=bool)
     abs_error = np.sqrt(np.sum((A_true - A_pred) ** 2, where=mask))
     return abs_error / np.sqrt(np.sum(A_true ** 2,  where=mask)) if relative else abs_error
 
@@ -280,7 +275,9 @@ def rectangular_eye(n: int, d: int):
     return eye
 
 
-def generate_matrices_given_pairwise_max_cosines(n: int, ds: list[int], pairwise_cos_mat: np.ndarray):
+def generate_matrices_given_pairwise_max_cosines(n: int,
+                                                 ds: list[int], pairwise_cos_mat: np.ndarray,
+                                                 eps=1e-6):
     assert pairwise_cos_mat.ndim == 2
     assert len(ds) == len(pairwise_cos_mat)
     assert np.allclose(pairwise_cos_mat, pairwise_cos_mat.T), "pairwise_cos_mat should be symmetric"
@@ -288,11 +285,16 @@ def generate_matrices_given_pairwise_max_cosines(n: int, ds: list[int], pairwise
     assert np.allclose(np.diag(pairwise_cos_mat), 1)
     assert np.all(pairwise_cos_mat >= 0) & np.all(pairwise_cos_mat <= 1), "pairwise_cos_mat entries should be in [0, 1]"
     m = len(ds)
-    stacked_Vs = np.random.randn(n, np.sum(ds))
+    d_total = sum(ds)
+    stacked_Vs = np.random.randn(n, d_total)
     cur_gram_mat = stacked_Vs.T @ stacked_Vs / n
     target_gram_mat = np.block([[pairwise_cos_mat[i, j] * rectangular_eye(ds[i], ds[j]) for j in range(m)]
                                 for i in range(m)])
-    stacked_Vs = stacked_Vs @ matrix_power(cur_gram_mat, -0.5) @ matrix_power(target_gram_mat, 0.5)
+
+    sqrt_cur_gram_mat = np.real(sqrtm(cur_gram_mat + eps * np.eye(d_total)))
+    sqrt_target_gram_mat = np.real(sqrtm(target_gram_mat + eps * np.eye(d_total)))
+
+    stacked_Vs = stacked_Vs @ np.linalg.pinv(sqrt_cur_gram_mat) @ sqrt_target_gram_mat
     cumsum_ds = [0] + list(np.cumsum(ds))
     return [stacked_Vs[:, s: e] for s, e in zip(cumsum_ds[:-1], cumsum_ds[1:])]
 

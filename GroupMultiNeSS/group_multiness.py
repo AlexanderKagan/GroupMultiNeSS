@@ -11,7 +11,6 @@ from .utils import if_scalar_or_given_length_array, fill_diagonals, \
     soft_thresholding_operator
 
 
-
 class BaseGroupMultiNeSS(BaseMultiNeSS):
     """
     Base class for group-structured MultiNeSS models.
