@@ -78,7 +78,7 @@ def ASE(A: np.array, d: int, check_if_symmetric: bool = True,
     if indef_inner_prod:
         sort_idx = np.argsort(eigvals)[::-1]
         eigvals = eigvals[sort_idx]
-        eigvecs = eigvecs[:, :sort_idx]
+        eigvecs = eigvecs[:, sort_idx]
         signature = np.where(eigvals > 0, 1., -1)
         ase = eigvecs @ np.diag(np.sqrt(np.abs(eigvals)))
         return (ase, signature) if return_signature else ase

@@ -3,7 +3,7 @@ from pathlib import Path
 this_directory = Path(__file__).parent
 LONG_DESCRIPTION = (this_directory / "README.md").read_text()
 
-VERSION = '0.0.4'
+VERSION = '0.0.5'
 DESCRIPTION = 'GroupMultiNeSS package'
 
 setup(
