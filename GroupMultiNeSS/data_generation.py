@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Union, List
+from typing import Optional, Union, List
 from warnings import warn
 
 from .utils import sigmoid, generate_matrices_given_pairwise_max_cosines
@@ -47,7 +47,7 @@ class LatentPositionGenerator:
                  d_individs: Union[List, int] = 2,
                  s_vu: float = 0.,
                  s_uu: float = 0.,
-                 comps_max_cosine_mat: np.array = None,
+                 comps_max_cosine_mat: Optional[np.ndarray] = None,
                  min_V_max_U_eigval_ratio=None):
 
         self.n_nodes = n_nodes

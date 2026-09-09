@@ -1,14 +1,16 @@
 import numpy as np
-from typing import List, Dict, Union, Tuple
+import matplotlib.pyplot as plt
+from typing import List, Dict, Optional, Union, Tuple
 from collections import Counter
 from functools import partial
 from joblib import Parallel, delayed
 from warnings import warn
+from multiprocessing import Manager
 
 from .multiness import BaseMultiNeSS, BaseMultiNeSSRefined, BaseMultiNeSSRefinedCV, BaseOracleMultiNeSS
 from .base import BaseRefitting
 from .utils import if_scalar_or_given_length_array, fill_diagonals, \
-    soft_thresholding_operator
+    soft_thresholding_operator, mean_frobenius_error
 
 
 class BaseGroupMultiNeSS(BaseMultiNeSS):
@@ -107,7 +109,7 @@ class BaseGroupMultiNeSS(BaseMultiNeSS):
         """
         return ["Shared component", "Group components", "Individual components"]
 
-    def _validate_input(self, As: List[np.array]):
+    def _validate_input(self, As: List[np.ndarray]):
         """
         Validate input data and group assignments.
 
@@ -160,10 +162,10 @@ class BaseGroupMultiNeSSRefined(BaseGroupMultiNeSS, BaseMultiNeSSRefined):
 
     def __init__(self, group_indices: List[int],
                  edge_distrib: str = "normal",
-                 max_rank: int = None, init_rank: int = None,
-                 sigmas: Union[float, List, np.ndarray] = None,
+                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
+                 sigmas: Optional[Union[float, List, np.ndarray]] = None,
                  loops_allowed: bool = True,
-                 n_jobs: int = None):
+                 n_jobs: Optional[int] = None):
         """
         Initialize BaseGroupMultiNeSSRefined.
         """
@@ -230,25 +232,8 @@ class BaseGroupMultiNeSSRefined(BaseGroupMultiNeSS, BaseMultiNeSSRefined):
                                         for group in self.unique_groups_},
                                      **{(1, 0): list(range(1 + self.n_groups_))}}
 
-    def _update_latent_history(self, key: Tuple[int, int]) -> None:
-        """
-        Update stored latent history for a given key.
-
-        Parameters
-        ----------
-        key : tuple
-            Optimization stage and group key.
-        """
-        stage, group = key
-        history_key = self._key_2_history_key[key]
-        if stage == 0:
-            self.latent_history_[history_key].append(
-                (self.get_group_latent_spaces()[group].copy(),
-                 self.get_individual_latent_spaces()[self.group_indices == group].copy()))
-        else:
-            self.latent_history_[history_key].append((self.get_shared_latent_space(), self.get_group_latent_spaces()))
-
-    def _fit(self, As, lr: Union[float, Tuple[float, float]] = 1., **optim_kwargs):
+    def _fit(self, As, lr: Union[float, Tuple[float, float]] = 1., n_epochs: int = 1, reinit: bool = True,
+             **optim_kwargs):
         """
         Fit the model using two-stage optimization for groups and shared components.
 
@@ -258,16 +243,160 @@ class BaseGroupMultiNeSSRefined(BaseGroupMultiNeSS, BaseMultiNeSSRefined):
             Input adjacency matrices.
         lr : float or tuple of float, default=1.
             Learning rates for stage 1 and 2.
+        n_epochs : int, default=1
+            Number of epochs to run the optimization.
+        reinit : bool, default=True
+            Whether to reinitialize the parameters before each epoch.
         """
-        self._pre_fit()
-        lr = if_scalar_or_given_length_array(lr, length=2, name="lr")
-        Parallel(n_jobs=self.n_jobs)(
-            [delayed(self._optimize_params)(key=(0, group),
-                                            As=As, lr=lr[0],
-                                            **optim_kwargs)
-             for group in self.unique_groups_])
-        self._optimize_params(key=(1, 0), As=As, lr=lr[1], **optim_kwargs)
+        self._pre_fit(n_epochs=n_epochs)
+        lrs = if_scalar_or_given_length_array(lr, length=2, name="lr")
+        for epoch in range(n_epochs):
+            # self._set_matrix(val=np.zeros((self.n_nodes_, self.n_nodes_)), idx=0)
+            Parallel(n_jobs=self.n_jobs)(
+                [delayed(self._optimize_params)(key=(0, group),
+                                                As=As, lr=lrs[0],
+                                                epoch=epoch,
+                                                reinit=(reinit and epoch == 0),
+                                                **optim_kwargs)
+                for group in self.unique_groups_])
+            # self._set_matrices(vals=np.zeros((self.n_groups_, self.n_nodes_, self.n_nodes_)), indices=np.arange(1, 1 + self.n_groups_))
+            self._optimize_params(key=(1, 0), As=As, lr=lrs[1],
+                                  epoch=epoch, 
+                                  reinit=(reinit and epoch == 0), 
+                                  **optim_kwargs)
 
+    def get_error_history(self, *true_params, relative_errors=True):
+        """
+        Compute convergence error curves for S, Q_k, R_kl, concatenated across epochs.
+
+        Parameters
+        ----------
+        true_params : tuple (S_true, Q_true, R_true)
+            S_true : np.ndarray, shape (n_nodes, n_nodes)
+            Q_true : array-like, shape (n_groups, n_nodes, n_nodes) -- Q_true[k]
+            R_true : array-like, shape (n_layers, n_nodes, n_nodes) -- R_true[l]
+        relative_errors : bool, default=True
+            Whether to compute relative Frobenius errors.
+
+        Returns
+        -------
+        dict
+            Maps each key (stage, group) to a dict with:
+            - "series": dict of series_name -> 1d np.ndarray of errors, one value
+            per iteration, concatenated across all epochs in fit order.
+            Stage 0, group k: "$S+Q_k$" and "$R_{k\\ell}$".
+            Stage 1: "$S$", "$Q_k$" for every group k, and "$\\bar{Q}$" (average
+            error across groups).
+            - "epoch_ends": cumulative iteration counts at which each epoch stopped.
+        """
+        assert self.latent_history_, "Set save_latent_history == True during fit to access latent_history!"
+        S_true, Q_true, R_true = true_params
+        Q_true, R_true = np.asarray(Q_true), np.asarray(R_true)
+
+        err_hist = {}
+        for key, history_key in self._key_2_history_key.items():
+            stage, group = key
+            series, epoch_ends, cum_iter = {}, [], 0
+
+            for epoch_history in self.latent_history_:
+                snapshots = epoch_history[history_key]  # list over iterations of [S_hat, Q_hat, R_hat]
+                for S_hat, Q_hat, R_hat in snapshots:
+                    if stage == 0:
+                        layers_in_group = np.where(np.asarray(self.group_indices) == group)[0]
+                        err_SQ = mean_frobenius_error(S_true + Q_true[group], S_hat + Q_hat[group],
+                                                    relative=relative_errors, include_offdiag=self.loops_allowed)
+                        err_R = np.mean([mean_frobenius_error(R_true[l], R_hat[l], relative=relative_errors,
+                                                            include_offdiag=self.loops_allowed)
+                                        for l in layers_in_group])
+                        series.setdefault(rf"$S+Q_{{{group}}}$", []).append(err_SQ)
+                        series.setdefault(rf"$R_{{{group}\ell}}$", []).append(err_R)
+                    else:
+                        err_S = mean_frobenius_error(S_true, S_hat, relative=relative_errors,
+                                                    include_offdiag=self.loops_allowed)
+                        series.setdefault("$S$", []).append(err_S)
+                        series.setdefault(r"$Q$", []).append(
+                            mean_frobenius_error(Q_true, Q_hat, relative=relative_errors, include_offdiag=self.loops_allowed)
+                        )
+                cum_iter += len(snapshots)
+                epoch_ends.append(cum_iter)
+
+            err_hist[key] = {"series": {name: np.array(vals) for name, vals in series.items()},
+                            "epoch_ends": epoch_ends}
+        return err_hist
+
+
+    def plot_error_history(self, *true_params, relative_errors=True, n_cols: int = 4,
+                        fontsize=14, figsize=(12, 20), print_final_errors=True):
+        """
+        Plot convergence of S+Q_k / R_kl (stage 1, per group) and S / Q_k / mean Q
+        (stage 2), with all epochs drawn on the same continuous x-axis. Epoch
+        boundaries are marked with bracket-shaped underlines labeled "Epoch {n}"
+        below the plot, rather than a numeric tick axis.
+
+        Parameters
+        ----------
+        true_params : tuple (S_true, Q_true, R_true)
+            Ground-truth components, see `get_error_history`.
+        relative_errors : bool, default=True
+            Whether to plot relative Frobenius errors.
+        n_cols : int, default=4
+            Number of subplot columns.
+        fontsize : int, default=14
+            Font size for labels/titles.
+        figsize : tuple, default=(12, 20)
+            Figure size.
+        print_final_errors : bool, default=True
+            Whether to print the final-iteration errors for each subplot.
+        """
+        from matplotlib.transforms import blended_transform_factory
+
+        err_hist = self.get_error_history(*true_params, relative_errors=relative_errors)
+        keys = sorted(err_hist.keys())  # (0, 0) ... (0, K-1), (1, 0)
+
+        n_cols = min(n_cols, len(keys))
+        n_rows = int(np.ceil(len(keys) / n_cols))
+        fig, axs = plt.subplots(ncols=n_cols, nrows=n_rows, figsize=figsize)
+        axs = np.array(axs).flatten()
+
+        bracket_y = -0.10
+        tick_height = 0.025
+        label_y = bracket_y - 0.02
+
+        for ax, key in zip(axs, keys):
+            hist = err_hist[key]
+            for name, errs in hist["series"].items():
+                ax.plot(np.arange(1, len(errs) + 1), errs, label=name)
+
+            epoch_ends = hist["epoch_ends"]
+            epoch_starts = [0] + list(epoch_ends[:-1])
+            trans = blended_transform_factory(ax.transData, ax.transAxes)
+
+            for epoch_num, (start, end) in enumerate(zip(epoch_starts, epoch_ends), start=1):
+                ax.plot([start, end], [bracket_y, bracket_y], transform=trans,
+                        color='black', linewidth=1.5, clip_on=False)
+                ax.plot([start, start], [bracket_y, bracket_y + tick_height], transform=trans,
+                        color='black', linewidth=1.5, clip_on=False)
+                ax.plot([end, end], [bracket_y, bracket_y + tick_height], transform=trans,
+                        color='black', linewidth=1.5, clip_on=False)
+                ax.text((start + end) / 2, label_y, f"Epoch {epoch_num}", transform=trans,
+                        ha='center', va='top', fontsize=max(fontsize - 4, 8), clip_on=False)
+
+            ax.set_ylabel("Error", fontsize=fontsize)
+            ax.set_title(self._key_2_history_key[key], fontsize=fontsize)
+            ax.tick_params(axis='both', which='major', labelsize=fontsize)
+            ax.legend(fontsize=fontsize)
+
+        for idx in range(len(keys), n_cols * n_rows):
+            fig.delaxes(axs[idx])
+        plt.tight_layout()
+
+        if print_final_errors:
+            final_errs = {self._key_2_history_key[key]: {name: round(float(errs[-1]), 3)
+                                                        for name, errs in hist["series"].items()}
+                        for key, hist in err_hist.items()}
+            print("Final errors:", final_errs)
+        plt.show()
+                
 
 class GroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseRefitting):
     """
@@ -296,15 +425,15 @@ class GroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseRefitting):
     """
 
     def __init__(self, group_indices: List[int],
-                 lmbda1: Union[float, np.ndarray, list] = None,
-                 lmbda2: float = None,
-                 alpha1: Union[float, np.ndarray, list] = None,
-                 alpha2: Union[float, np.ndarray, list] = None,
+                 lmbda1: Optional[Union[float, np.ndarray, list]] = None,
+                 lmbda2: Optional[float] = None,
+                 alpha1: Optional[Union[float, np.ndarray, list]] = None,
+                 alpha2: Optional[Union[float, np.ndarray, list]] = None,
                  edge_distrib: str = "normal",
-                 max_rank: int = None, init_rank: int = None,
-                 sigmas: Union[float, List, np.ndarray] = None,
+                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
+                 sigmas: Optional[Union[float, List[float], np.ndarray]] = None,
                  loops_allowed: bool = True,
-                 n_jobs: int = None,
+                 n_jobs: Optional[int] = None,
                  refit_threshold: float = 1e-8):
         """
         Initialize GroupMultiNeSS model.
@@ -392,10 +521,12 @@ class GroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseRefitting):
                 for group in self.unique_groups_},
              **{(1, 0): {"lmbda2": lmbda2, "alpha2": alpha2}}}
 
-    def fit(self, As: List[np.array],
+    def fit(self, As: List[np.ndarray],
             lr: Union[float, Tuple[float, float]] = 1e-1,
             max_iter: int = 100, tol=1e-5, patience=10,
-            refit=True, verbose: bool = False, verbose_interval=1,
+            refit=True, reinit=True,
+            n_epochs: int = 1,
+            verbose: bool = False, verbose_interval=1,
             save_latent_history=False, save_nll_history=True):
         """
         Fit the GroupMultiNeSS model.
@@ -414,6 +545,10 @@ class GroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseRefitting):
             Early stopping patience.
         refit : bool, default=True
             Whether to refit components.
+        n_epochs : int, default=1
+            Number of epochs to run the optimization.
+        reinit : bool, default=True
+            Whether to reinitialize the parameters
         verbose : bool, default=False
             Verbosity flag.
         verbose_interval : int, default=1
@@ -429,31 +564,34 @@ class GroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseRefitting):
             Fitted model instance.
         """
         As = self._validate_input(As=As)
-        self._fit(As, lr=lr,
+        self._fit(As, lr=lr, n_epochs=n_epochs,
                   max_iter=max_iter, tol=tol, patience=patience,
-                  refit=refit,
+                  reinit=reinit, refit=False,
                   verbose=verbose, verbose_interval=verbose_interval,
                   save_latent_history=save_latent_history, save_nll_history=save_nll_history)
+        
+        if refit:
+            self.refit(As, refit_matrix_indices=np.arange(self.n_fitted_matrices))
         return self
 
 
 class GroupMultiNeSSCV(GroupMultiNeSS, BaseMultiNeSSRefinedCV):
     def __init__(self, group_indices: List[int],
-                 param_grid: Dict[str, List] = None,
+                 param_grid: Optional[Dict[str, List[float]]] = None,
                  edge_distrib: str = "normal",
-                 lmbda1: Union[float, np.ndarray, list] = None,
-                 lmbda2: float = None,
-                 alpha1: Union[float, np.ndarray, list] = None,
-                 alpha2: Union[float, np.ndarray, list] = None,
+                 lmbda1: Optional[Union[float, np.ndarray, list]] = None,
+                 lmbda2: Optional[float] = None,
+                 alpha1: Optional[Union[float, np.ndarray, list]] = None,
+                 alpha2: Optional[Union[float, np.ndarray, list]] = None,
                  loops_allowed: bool = True,
-                 cv_folds=3, test_prop=0.1,
-                 max_rank: int = None, init_rank: int = None,
-                 sigmas: Union[float, List, np.ndarray] = None,
-                 n_jobs: int = None,
+                 cv_folds: int = 3, test_prop: float = 0.1,
+                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
+                 sigmas: Optional[Union[float, List[float], np.ndarray]] = None,
+                 n_jobs: Optional[int] = None,
                  refit_threshold=1e-8,
                  fix_layer_split: bool = False,
                  use_1se_rule: bool = False,
-                 random_seed: int = None):
+                 random_seed: Optional[int] = None):
 
         BaseMultiNeSSRefinedCV.__init__(self, param_grid=param_grid, cv_folds=cv_folds, test_prop=test_prop,
                                         loops_allowed=loops_allowed,
@@ -486,9 +624,9 @@ class OracleGroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseOracleMultiNeSS):
     def __init__(self, group_indices: List[int],
                  d_shared: int, d_groups: List[int], d_individs: List[int],
                  edge_distrib: str = "normal",
-                 sigmas: Union[float, List, np.ndarray] = None,
+                 sigmas: Optional[Union[float, List[float], np.ndarray]] = None,
                  loops_allowed: bool = True,
-                 n_jobs: int = None):
+                 n_jobs: Optional[int] = None):
 
         BaseGroupMultiNeSSRefined.__init__(self, group_indices=group_indices,
                                            edge_distrib=edge_distrib, sigmas=sigmas,

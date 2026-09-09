@@ -1,11 +1,12 @@
+from abc import ABC, abstractmethod
+
 import numpy as np
 from numpy.linalg import norm
-from typing import List, Union
+from typing import List, Optional, Union
 from warnings import warn
 from typing import Iterable
 from multiprocessing import shared_memory
 import statsmodels.api as sm
-from more_itertools import zip_equal
 
 from .utils import sigmoid, leading_left_eigenvectors
 
@@ -18,8 +19,8 @@ class SharedMemoryMatrixFitter:
     which can be used for parallel computations without duplicating data.
     """
 
-    def _init_param_matrices(self, vals: Union[List[np.ndarray], np.ndarray] = None,
-                             shape: Iterable[int] = None) -> None:
+    def _init_param_matrices(self, vals: Optional[Union[List[np.ndarray], np.ndarray]] = None,
+                             shape: Optional[Iterable[int]] = None) -> None:
         """
         Initialize shared memory for parameter matrices.
 
@@ -36,7 +37,7 @@ class SharedMemoryMatrixFitter:
         - Allocates shared memory of type float64 for storing matrices.
         """
         if shape is None:
-            assert vals is not None, "One of vals or shape arguments should berandom_seed provided!"
+            assert vals is not None, "One of vals or shape arguments should be provided!"
             vals = np.array(vals)
             shape = vals.shape
         elif vals is not None:
@@ -62,7 +63,7 @@ class SharedMemoryMatrixFitter:
         param_matrices = self.get_all_fitted_matrices()
         param_matrices[idx] = val
 
-    def _set_matrices(self, vals, indices: Union[List[int], np.ndarray] = None):
+    def _set_matrices(self, vals, indices: Optional[Union[List[int], np.ndarray]] = None):
         """
         Set multiple matrices in shared memory.
 
@@ -76,7 +77,7 @@ class SharedMemoryMatrixFitter:
         if indices is None:
             indices = list(range(len(self.get_all_fitted_matrices())))
         assert len(vals) == len(indices)
-        for idx, val in zip_equal(indices, vals):
+        for idx, val in zip(indices, vals, strict=True):
             self._set_matrix(val, idx)
 
     def get_all_fitted_matrices(self):
@@ -91,7 +92,8 @@ class SharedMemoryMatrixFitter:
         return np.ndarray(self.param_matrices.shape, dtype=np.float64, buffer=self._param_matrices_shm.buf)
 
 
-class BaseMultiplexNetworksModel:
+
+class BaseMultiplexNetworksModel(ABC):
     """
     Base class for multiplex network models.
 
@@ -118,7 +120,7 @@ class BaseMultiplexNetworksModel:
         else:
             raise NotImplementedError("Edge distribution should be either normal or bernoulli!")
 
-    def _validate_input(self, As: List[np.array]) -> np.ndarray:
+    def _validate_input(self, As: List[np.ndarray]) -> np.ndarray:
         """
         Validate input adjacency matrices.
 
@@ -147,6 +149,7 @@ class BaseMultiplexNetworksModel:
         self._param_participance_masks = self._get_param_participance_masks()
         return np.stack(As)
 
+    @abstractmethod
     def _get_param_participance_masks(self) -> np.ndarray:
         """
         Return masks indicating which parameters participate in each layer.
@@ -166,7 +169,7 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
     Base class for refitting latent matrices in multiplex network models.
     """
 
-    def __init__(self, edge_distrib="normal", max_rank: int = None, loops_allowed: bool = True,
+    def __init__(self, edge_distrib="normal", max_rank: Optional[int] = None, loops_allowed: bool = True,
                  refit_threshold: float = 1e-8):
         """
         Initialize the BaseRefitting object.
@@ -250,7 +253,7 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
         refit_matrix_participance_masks = self._param_participance_masks[refit_matrix_indices][:, obs_mask]
 
         design_mat = []
-        for param_design, participance_mask in zip_equal(param_designs, refit_matrix_participance_masks):
+        for param_design, participance_mask in zip(param_designs, refit_matrix_participance_masks, strict=True):
             design_mat.append(np.vstack([param_design if participate else np.zeros_like(param_design)
                                          for participate in participance_mask]))
 
@@ -306,7 +309,7 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
                                            refit_matrix_indices))  # don't refit rank zero matrices after hard-threshold
         return np.array(refit_matrix_indices, dtype=int)
 
-    def refit(self, As: Union[List[np.array], np.array], refit_matrix_indices=None):
+    def refit(self, As: Union[List[np.ndarray], np.ndarray], refit_matrix_indices=None):
         """
         Refit parameter matrices using GLM based on current adjacency matrices.
 

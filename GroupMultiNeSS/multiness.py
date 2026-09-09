@@ -1,12 +1,13 @@
+from abc import abstractmethod
+
 import numpy as np
-from typing import List, Dict, Callable, Union, Tuple
+from typing import List, Dict, Callable, Optional, Union, Tuple
 import matplotlib.pyplot as plt
 from functools import partial
 import seaborn as sns
 from multiprocessing import Manager
-from copy import deepcopy
+from copy import copy
 from itertools import product
-from more_itertools import zip_equal
 
 from .utils import soft_thresholding_operator, hard_thresholding_operator, make_error_report, \
     mean_frobenius_error, EarlyStopper, if_scalar_or_given_length_array, fill_diagonals, \
@@ -40,7 +41,7 @@ class BaseMultiNeSS(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
         """
         return [self.get_shared_latent_space(), self.get_individual_latent_spaces()]
 
-    def get_all_matrix_latent_positions(self, ds: List[int] = None, check_if_symmetric=True):
+    def get_all_matrix_latent_positions(self, ds: Optional[List[int]] = None, check_if_symmetric=True):
         """
         Compute latent positions for all fitted matrices using adjacency spectral embedding (ASE).
 
@@ -60,7 +61,7 @@ class BaseMultiNeSS(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
         if ds is None:
             ds = [np.linalg.matrix_rank(matrix) for matrix in matrices]
         return [ASE(matrix, d, check_if_symmetric=check_if_symmetric) if d != 0 else np.empty((self.n_nodes_, 0))
-                for matrix, d in zip_equal(matrices, ds)]
+                for matrix, d in zip(matrices, ds, strict=True)]
 
     def get_node_latent_positions_across_layers(self):
         """
@@ -168,8 +169,8 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
     """
 
     def __init__(self, edge_distrib: str = "normal", loops_allowed: bool = True,
-                 max_rank: int = None, init_rank: int = None,
-                 sigmas: Union[float, List, np.ndarray] = None):
+                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
+                 sigmas: Optional[Union[float, List, np.ndarray]] = None):
         """
         Initialize a refined MultiNeSS model with specified configuration.
 
@@ -203,14 +204,16 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
             Key identifying optimization stage.
         """
         param_indices = self._key_2_param_indices[key]
-        param_inits = []
-        for idx in param_indices:
-            mask = self._param_participance_masks[idx]
-            param_init = hard_thresholding_operator(np.nansum(As[mask], axis=0) / mask.sum(), max_rank=self.init_rank)
-            param_inits.append(param_init)
-        self._set_matrices(param_inits, indices=param_indices)
+        for idx in sorted(param_indices):
+            layers_mask = self._param_participance_masks[idx]
+            offset_params_mask = self._param_participance_masks.copy()
+            offset_params_mask[idx] = False
+            As_resids = As - np.einsum('pm,pij->mij', offset_params_mask, self.get_all_fitted_matrices())
+            param_init = hard_thresholding_operator(np.nansum(As_resids[layers_mask], axis=0) / layers_mask.sum(), 
+                                                    max_rank=self.init_rank)
+            self._set_matrix(param_init, idx)
 
-    def _update_history(self, nll: float, key: Tuple[int, int],
+    def _update_history(self, nll: float, key: Tuple[int, int], epoch: int = 0,
                         save_nll_history: bool = True,
                         save_latent_history: bool = False) -> None:
         """
@@ -226,25 +229,15 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
             Whether to save NLL history.
         save_latent_history : bool, default=False
             Whether to save latent variable history.
+        epoch : int, default=0
+            Current epoch number.
         """
         if save_nll_history:
-            self._update_nll_history(nll=nll, key=key)
+            self._update_nll_history(nll=nll, key=key, epoch=epoch)
         if save_latent_history:
-            self._update_latent_history(key)
+            self._update_latent_history(key, epoch=epoch)
 
-    def _reset_history(self, key: Tuple[int, int]):
-        """
-        Reset optimization history for a given key.
-
-        Parameters
-        ----------
-        key : tuple of int
-            Identifier for optimization stage.
-        """
-        hist_key = self._key_2_history_key[key]
-        self.nll_history_[hist_key][:] = []
-
-    def _update_nll_history(self, nll: float, key: Tuple[int, int]):
+    def _update_nll_history(self, nll: float, key: Tuple[int, int], epoch: int = 0):
         """
         Append new negative log-likelihood value to history.
 
@@ -254,11 +247,13 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
             Negative log-likelihood value.
         key : tuple of int
             Identifier for optimization stage.
+        epoch : int, default=0
+            Current epoch number.
         """
         history_key = self._key_2_history_key[key]
-        self.nll_history_[history_key].append(nll)
+        self.nll_history_[epoch][history_key].append(nll)
 
-    def _update_latent_history(self, key: Tuple[int, int]):
+    def _update_latent_history(self, key: Tuple[int, int], epoch: int = 0):
         """
         Append current latent space matrices to history.
 
@@ -266,9 +261,11 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         ----------
         key : tuple of int
             Identifier for optimization stage.
+        epoch : int, default=0
+            Current epoch number.
         """
         history_key = self._key_2_history_key[key]
-        self.latent_history_[history_key].append(deepcopy(self.get_all_fitted_matrices_by_type()))
+        self.latent_history_[epoch][history_key].append(copy(self.get_all_fitted_matrices_by_type()))
 
     def _make_key_2_history_key_dict(self) -> None:
         """Create mapping from optimization keys to history keys."""
@@ -304,7 +301,7 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
             param_val = param_val if np.isscalar(old_val) else param_val * np.ones_like(old_val)
             self._key_2_hyperparams_dict[key][param_name] = param_val
 
-    def _init_history(self, manager: Manager):
+    def _init_history(self, manager: Manager, n_epochs: int = 1):
         """
         Initialize shared memory-based history tracking structures.
 
@@ -312,11 +309,15 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         ----------
         manager : multiprocessing.Manager
             Shared memory manager for inter-process synchronization.
+        n_epochs : int, default=1
+            Number of epochs to initialize history for.
         """
         self._shm_lock = manager.Lock()
         self.optim_info = manager.dict({'n_svd_calls': 0})
-        self.nll_history_ = manager.dict({hist_key: manager.list() for hist_key in self._key_2_history_key.values()})
-        self.latent_history_ = manager.dict({hist_key: manager.list() for hist_key in self._key_2_history_key.values()})
+        self.nll_history_ = manager.list([manager.dict({hist_key: manager.list() for hist_key in self._key_2_history_key.values()})
+                                          for _ in range(n_epochs)])
+        self.latent_history_ = manager.list([manager.dict({hist_key: manager.list() for hist_key in self._key_2_history_key.values()})
+                                             for _ in range(n_epochs)])
 
     def _validate_hyperparams(self):
         """
@@ -355,11 +356,12 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         else:
             raise NotImplementedError("sigmas should be a scalar, 1d, 2d, or 3d array.")
 
+    @abstractmethod
     def _compute_projected_map(self, idx: int, lr: float, key: Tuple[int, int]) -> Callable:
         """Placeholder for projected map computation (to be implemented in subclass)."""
         pass
 
-    def _update_matrix(self, idx, lr: float, sample_grads: np.array, key: Tuple[int, int]):
+    def _update_matrix(self, idx, lr: float, sample_grads: np.ndarray, key: Tuple[int, int]):
         """
         Update a single parameter matrix via gradient step and projection.
 
@@ -386,14 +388,14 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         """int: Total number of fitted matrices (shared + individual)."""
         return 1 + self.n_layers_
 
-    def _pre_fit(self):
+    def _pre_fit(self, n_epochs: int = 1):
         """Perform pre-fitting initialization including parameters, keys, and history."""
         self._init_param_matrices(np.zeros((self.n_fitted_matrices, self.n_nodes_, self.n_nodes_)))
         self._validate_hyperparams()
         self._init_keys()
-        self._init_history(manager=Manager())
+        self._init_history(manager=Manager(), n_epochs=n_epochs)
 
-    def _optimization_step(self, param_indices, key: Tuple[int, int], As, lr: float, iteration: int,
+    def _optimization_step(self, param_indices, key: Tuple[int, int], As, lr: float, iteration: int, epoch: int,
                            verbose: bool, tol: float,
                            save_latent_history: bool, save_nll_history: bool) -> float:
         """
@@ -411,6 +413,8 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
             Learning rate.
         iteration : int
             Current iteration number.
+        epoch : int
+            Current epoch number.
         verbose : bool
             Whether to print progress.
         tol : float
@@ -433,7 +437,7 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         nll = self._compute_nll(As, obs_mask=obs_mask)
 
         with self._shm_lock:
-            self._update_history(nll, key=key,
+            self._update_history(nll, key=key, epoch=epoch,
                                  save_latent_history=save_latent_history, save_nll_history=save_nll_history)
 
         if verbose:
@@ -445,7 +449,9 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
                          max_iter: int, tol: float, patience,
                          verbose: bool, verbose_interval: int,
                          save_latent_history: bool, save_nll_history: bool,
-                         refit: bool):
+                         refit: bool = True, reinit: bool = True,
+                         epoch: int = 0
+                        ):
         """
         Optimize model parameters via iterative updates and early stopping.
 
@@ -473,14 +479,19 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
             Whether to save NLL values.
         refit : bool
             Whether to refit parameters after optimization.
+        reinit : bool, default=True
+            Whether to reinitialize parameters before optimization.
+        epoch : int, default=0
+            Current epoch number.
         """
-        self._reset_history(key=key)
         param_indices = self._key_2_param_indices[key]
-        self._optimized_params_init(As, key=key)
+        if reinit:
+            self._optimized_params_init(As, key=key)
+
         early_stopper = EarlyStopper(patience=patience, higher_better=False, rtol=tol)
         for iteration in range(max_iter):
-            nll = self._optimization_step(param_indices, key=key, As=As, lr=lr, iteration=iteration, tol=tol,
-                                          verbose=verbose and iteration % verbose_interval == 0,
+            nll = self._optimization_step(param_indices, key=key, As=As, lr=lr, iteration=iteration, epoch=epoch, tol=tol,
+                                          verbose=verbose and iteration % verbose_interval == 0, 
                                           save_latent_history=save_latent_history, save_nll_history=save_nll_history)
 
             if early_stopper.stop_check(nll):
@@ -493,7 +504,7 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         if refit:
             self.refit(As, refit_matrix_indices=param_indices)
 
-    def _fit(self, As, **optim_kwargs):
+    def _fit(self, As, n_epochs: int = 1, **optim_kwargs):
         """
         Full model fitting routine combining initialization and optimization.
 
@@ -504,7 +515,7 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         **optim_kwargs
             Optimization keyword arguments passed to `_optimize_params`.
         """
-        self._pre_fit()
+        self._pre_fit(n_epochs=n_epochs)
         self._optimize_params(As=As, key=(0, 0), **optim_kwargs)
 
     def _nll_sample_grads(self, As):
@@ -602,16 +613,79 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         Returns
         -------
         list of dict
-            Error values for each iteration.
+            For each epoch, a dict mapping optimization-stage name to the list of
+            per-iteration error reports for that stage (mirrors the structure of
+            `nll_history_` / `latent_history_`).
         """
         assert self.latent_history_, "Set save_latent_history == True during fit to access latent_history!"
         assert len(true_params) == len(self._get_all_fitted_parameter_names()), \
             f"Length of true_params should be equal to {len(self._get_all_fitted_parameter_names())}"
-        err_hist = []
-        for estimate_params in self.latent_history_:
-            iteration_errs = make_error_report(true_params, estimate_params, relative_errors=relative_errors)
-            err_hist.append(iteration_errs)
-        return err_hist
+        err_hist_over_epochs = []
+        for epoch_history in self.latent_history_:
+            err_hist = {}
+            for stage, param_estimates_over_iter in epoch_history.items():
+                iteration_errs = [make_error_report(true_params, param_estimates, relative_errors=relative_errors)
+                                  for param_estimates in param_estimates_over_iter]
+                err_hist[stage] = iteration_errs
+            err_hist_over_epochs.append(err_hist)
+        return err_hist_over_epochs
+
+    def plot_error_history(self, *true_params, relative_errors=True, labels=None, n_cols: int = 4,
+                           fontsize=14, figsize=(12, 20), print_final_errors=True):
+        """
+        Plot evolution of parameter estimation errors over iterations, one subplot
+        per optimization stage within each epoch (analogous to `plot_nll_history`).
+
+        Parameters
+        ----------
+        *true_params : list of np.ndarray
+            Ground truth parameters.
+        relative_errors : bool, default=True
+            Whether to plot relative errors.
+        labels : list of str, optional
+            Custom labels for parameters.
+        n_cols : int, default=4
+            Number of subplot columns.
+        fontsize : int, default=14
+            Font size for plot.
+        figsize : tuple, default=(12, 20)
+            Figure size.
+        print_final_errors : bool, default=True
+            Whether to print final iteration errors.
+        """
+        if labels is None:
+            labels = self._get_all_fitted_parameter_names()
+        else:
+            assert len(true_params) == len(labels), \
+                "labels should be of the same length as the length of true_params"
+
+        err_hist_over_epochs = self.get_error_history(*true_params, relative_errors=relative_errors)
+        for epoch, epoch_err_hist in enumerate(err_hist_over_epochs):
+            epoch_n_cols = min(n_cols, len(epoch_err_hist))
+            n_rows = int(np.ceil(len(epoch_err_hist) / epoch_n_cols))
+            fig, axs = plt.subplots(ncols=epoch_n_cols, nrows=n_rows, figsize=figsize)
+            axs = np.array(axs).flatten()
+
+            for ax, (stage, iteration_errs) in zip(axs, epoch_err_hist.items()):
+                stage_errs = np.stack(iteration_errs)  # shape (n_iterations, n_params)
+                ax.plot(stage_errs, label=labels)
+                ax.set_xlabel("Iteration", fontsize=fontsize)
+                ax.set_ylabel("Error", fontsize=fontsize)
+                ax.set_title(f"{stage}", fontsize=fontsize)
+                ax.tick_params(axis='both', labelsize=fontsize)
+            axs[0].legend(fontsize=fontsize)
+
+            for idx in range(len(epoch_err_hist), epoch_n_cols * n_rows):
+                fig.delaxes(axs[idx])  # Remove extra axes
+            plt.tight_layout()
+            if len(epoch_err_hist) > 1:
+                plt.suptitle(f"Epoch {epoch}", fontsize=fontsize + 2)
+
+            if print_final_errors:
+                final_errs = {stage: np.round(iteration_errs[-1], 2)
+                             for stage, iteration_errs in epoch_err_hist.items()}
+                print(f"Final errors after epoch {epoch}:", final_errs)
+            plt.show()
 
     def plot_nll_history(self, n_cols: int = 4, fontsize: int = 14, figsize=(12, 20)):
         """
@@ -626,54 +700,89 @@ class BaseMultiNeSSRefined(BaseMultiNeSS, BaseRefitting):
         figsize : tuple, default=(12, 20)
             Figure size.
         """
-        n_cols = min(n_cols, len(self.nll_history_))
-        n_rows = int(np.ceil(len(self.nll_history_) / n_cols))
-        fig, axs = plt.subplots(ncols=n_cols, nrows=n_rows, figsize=figsize)
-        axs = np.array(axs).flatten()
-        for ax, (stage, nll_hist) in zip(axs, self.nll_history_.items()):
-            ax.plot(nll_hist)
-            ax.set_xlabel("Iteration", fontsize=fontsize)
-            ax.set_ylabel("Negative Loglikelihood", fontsize=fontsize)
-            ax.set_title(f"{stage}", fontsize=fontsize)
-            ax.tick_params(axis='both', labelsize=fontsize)
-        for idx in range(len(self.nll_history_), n_cols * n_rows):
-            fig.delaxes(axs[idx])  # Remove extra axes
-        plt.tight_layout()
-        plt.show()
+        for epoch, epoch_nll_hist in enumerate(self.nll_history_):
+            n_cols = min(n_cols, len(epoch_nll_hist))
+            n_rows = int(np.ceil(len(epoch_nll_hist) / n_cols))
+            fig, axs = plt.subplots(ncols=n_cols, nrows=n_rows, figsize=figsize)
+            axs = np.array(axs).flatten()
+            for ax, (stage, nll_hist) in zip(axs, epoch_nll_hist.items()):
+                ax.plot(nll_hist)
+                ax.set_xlabel("Iteration", fontsize=fontsize)
+                ax.set_ylabel("Negative Loglikelihood", fontsize=fontsize)
+                ax.set_title(f"{stage}", fontsize=fontsize)
+                ax.tick_params(axis='both', labelsize=fontsize)
+            for idx in range(len(epoch_nll_hist), n_cols * n_rows):
+                fig.delaxes(axs[idx])  # Remove extra axes
+            plt.tight_layout()
+            if len(epoch_nll_hist) > 1:
+                plt.title(f"Epoch {epoch}", fontsize=fontsize + 2)
+            plt.show()
 
-    def plot_error_history(self, *true_params, relative_errors=True, labels=None, fontsize=14,
-                           print_final_errors=True):
+    def plot_nll_history(self, n_cols: int = 4, fontsize: int = 14, figsize=(12, 20)):
         """
-        Plot evolution of parameter estimation errors over iterations.
+        Plot negative log-likelihood convergence per stage/group, with all epochs
+        drawn on the same continuous x-axis. Epoch boundaries are marked with
+        bracket-shaped underlines labeled "Epoch {n}" below each plot.
 
         Parameters
         ----------
-        *true_params : list of np.ndarray
-            Ground truth parameters.
-        relative_errors : bool, default=True
-            Whether to plot relative errors.
-        labels : list of str, optional
-            Custom labels for parameters.
+        n_cols : int, default=4
+            Number of subplot columns.
         fontsize : int, default=14
-            Font size for plot.
-        print_final_errors : bool, default=True
-            Whether to print final iteration errors.
+            Font size for labels and titles.
+        figsize : tuple, default=(12, 20)
+            Figure size.
         """
-        if labels is None:
-            labels = self._get_all_fitted_parameter_names()
-        else:
-            assert len(true_params) == len(labels), \
-                "labels should be of the same length as the length of true_params"
+        from matplotlib.transforms import blended_transform_factory
 
-        err_hist = self.get_error_history(*true_params, relative_errors=relative_errors)
-        if print_final_errors:
-            print("Final errors:", np.round(err_hist[-1], 2))
-        plt.figure(figsize=(12, 8))
-        plt.plot(err_hist, label=labels)
-        plt.legend(fontsize=fontsize)
-        plt.xlabel("Iteration", fontsize=fontsize)
-        plt.ylabel("Error", fontsize=fontsize)
-        plt.title("Relative Frobenius Errors", fontsize=fontsize)
+        keys = sorted(self._key_2_history_key.keys())  # (0, 0) ... (0, K-1), (1, 0)
+
+        nll_hist = {}
+        for key in keys:
+            history_key = self._key_2_history_key[key]
+            vals, epoch_ends, cum_iter = [], [], 0
+            for epoch_nll_hist in self.nll_history_:
+                epoch_vals = list(epoch_nll_hist[history_key])
+                vals.extend(epoch_vals)
+                cum_iter += len(epoch_vals)
+                epoch_ends.append(cum_iter)
+            nll_hist[key] = {"nll": np.array(vals), "epoch_ends": epoch_ends}
+
+        n_cols = min(n_cols, len(keys))
+        n_rows = int(np.ceil(len(keys) / n_cols))
+        fig, axs = plt.subplots(ncols=n_cols, nrows=n_rows, figsize=figsize)
+        axs = np.array(axs).flatten()
+
+        bracket_y = -0.10
+        tick_height = 0.025
+        label_y = bracket_y - 0.02
+
+        for ax, key in zip(axs, keys):
+            hist = nll_hist[key]
+            ax.plot(np.arange(1, len(hist["nll"]) + 1), hist["nll"])
+
+            epoch_ends = hist["epoch_ends"]
+            epoch_starts = [0] + list(epoch_ends[:-1])
+            trans = blended_transform_factory(ax.transData, ax.transAxes)
+
+            for epoch_num, (start, end) in enumerate(zip(epoch_starts, epoch_ends), start=1):
+                ax.plot([start, end], [bracket_y, bracket_y], transform=trans,
+                        color='black', linewidth=1.5, clip_on=False)
+                ax.plot([start, start], [bracket_y, bracket_y + tick_height], transform=trans,
+                        color='black', linewidth=1.5, clip_on=False)
+                ax.plot([end, end], [bracket_y, bracket_y + tick_height], transform=trans,
+                        color='black', linewidth=1.5, clip_on=False)
+                ax.text((start + end) / 2, label_y, f"Epoch {epoch_num}", transform=trans,
+                        ha='center', va='top', fontsize=max(fontsize - 4, 8), clip_on=False)
+
+            ax.set_ylabel("Negative Loglikelihood", fontsize=fontsize)
+            ax.set_title(self._key_2_history_key[key], fontsize=fontsize)
+            ax.tick_params(axis='both', which='major', labelsize=fontsize)
+
+        for idx in range(len(keys), n_cols * n_rows):
+            fig.delaxes(axs[idx])
+        plt.tight_layout()
+        plt.show()
 
 
 class BaseMultiNeSSRefinedCV(BaseMultiNeSSRefined):
@@ -700,8 +809,8 @@ class BaseMultiNeSSRefinedCV(BaseMultiNeSSRefined):
         Random seed for reproducibility.
     """
 
-    def __init__(self, param_grid: Dict[str, List] = None, cv_folds=None, test_prop=0.1,
-                 fix_layer_split: bool = False, use_1se_rule=False, random_seed: int = None, **kwargs):
+    def __init__(self, param_grid: Optional[Dict[str, List]] = None, cv_folds=3, test_prop=0.1,
+                 fix_layer_split: bool = False, use_1se_rule=False, random_seed: Optional[int] = None, **kwargs):
         super().__init__(**kwargs)
         self.cv_folds = cv_folds
         self.test_prop = test_prop
@@ -730,7 +839,7 @@ class BaseMultiNeSSRefinedCV(BaseMultiNeSSRefined):
         super()._init_keys()
         self._make_key_2_hyperparams_grid_dict()
 
-    def _init_history(self, manager: Manager):
+    def _init_history(self, manager: Manager, n_epochs: int = 1):
         """
         Initialize multiprocessing-safe containers for cross-validation results.
 
@@ -738,8 +847,10 @@ class BaseMultiNeSSRefinedCV(BaseMultiNeSSRefined):
         ----------
         manager : multiprocessing.Manager
             Shared-memory manager used to create thread-safe dictionaries and lists.
+        n_epochs : int, default=1
+            Number of epochs for which to initialize the history.
         """
-        super()._init_history(manager)
+        super()._init_history(manager, n_epochs=n_epochs)
         self._cv_results = manager.dict(
             {key: manager.dict({params: manager.list() for params in product(*param_grid_dict.values())})
              for key, param_grid_dict in self._key_2_hyperparams_grid.items()}
@@ -937,11 +1048,11 @@ class MultiNeSS(BaseMultiNeSSRefined, BaseRefitting):
     """
 
     def __init__(self,
-                 lmbda: float = None,
-                 alpha: Union[float, List, np.ndarray] = None,
-                 max_rank: int = None, init_rank: int = None,
+                 lmbda: Optional[float] = None,
+                 alpha: Optional[Union[float, List, np.ndarray]] = None,
+                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
                  edge_distrib: str = "normal",
-                 sigmas: Union[float, List, np.ndarray] = None,
+                 sigmas: Optional[Union[float, List, np.ndarray]] = None,
                  loops_allowed: bool = True,
                  refit_threshold=1e-8):
 
@@ -1007,7 +1118,7 @@ class MultiNeSS(BaseMultiNeSSRefined, BaseRefitting):
             alpha = if_scalar_or_given_length_array(self.alpha, length=self.n_layers_, name="alpha")
         self._key_2_hyperparams_dict = {(0, 0): {"lmbda": lmbda, "alpha": alpha}}
 
-    def fit(self, As: List[np.array],
+    def fit(self, As: List[np.ndarray],
             lr: float = 1.,
             max_iter: int = 100, tol=1e-5, patience=10,
             refit=True,
@@ -1060,17 +1171,17 @@ class MultiNeSSCV(MultiNeSS, BaseMultiNeSSRefinedCV):
     Extends `MultiNeSS` with hyperparameter selection via cross-validation.
     """
 
-    def __init__(self, param_grid: Dict[str, List[float]] = None, cv_folds=3, test_prop=0.1,
-                 lmbda: float = None,
-                 alpha: Union[float, np.ndarray, list] = None,
+    def __init__(self, param_grid: Optional[Dict[str, List[float]]] = None, cv_folds=3, test_prop=0.1,
+                 lmbda: Optional[float] = None,
+                 alpha: Optional[Union[float, np.ndarray, list]] = None,
                  edge_distrib: str = "normal",
-                 max_rank: int = None, init_rank: int = None,
-                 sigmas: Union[float, List, np.ndarray] = None,
+                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
+                 sigmas: Optional[Union[float, List[float], np.ndarray]] = None,
                  loops_allowed: bool = True,
                  refit_threshold: float = 1e-8,
                  fix_layer_split: bool = False,
                  use_1se_rule: bool = False,
-                 random_seed: int = None):
+                 random_seed: Optional[int] = None):
         """
         Initialize a MultiNeSS model with cross-validation.
 
@@ -1137,6 +1248,7 @@ class BaseOracleMultiNeSS(BaseMultiNeSSRefined):
     Inherits all parameters from BaseMultiNeSSRefined.
     """
 
+    @abstractmethod
     def _compute_threshold_rank(self, idx: int, key: Tuple[int, int]) -> int:
         """
         Compute the threshold rank for hard-thresholding operator.
@@ -1196,7 +1308,7 @@ class BaseOracleMultiNeSS(BaseMultiNeSSRefined):
             param_inits.append(param_init)
         self._set_matrices(param_inits, indices=param_indices)
 
-    def fit(self, As: List[np.array],
+    def fit(self, As: List[np.ndarray],
             lr: float = 1.,
             max_iter: int = 100, tol=1e-5, patience=10,
             verbose=True, verbose_interval=1,

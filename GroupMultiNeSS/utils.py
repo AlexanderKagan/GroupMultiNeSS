@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.sparse.linalg import svds, eigsh
-from typing import List, Union, Tuple
+from typing import List, Optional, Union, Tuple
 from copy import copy
 from scipy.linalg import sqrtm
 from sklearn.model_selection import KFold
@@ -37,14 +37,14 @@ class MultipleNetworkTrainTestSplitter:
         self.random_seed = random_seed
         self.check_if_sym_input = check_if_sym_input
 
-    def _validate_input(self, As: np.array):
+    def _validate_input(self, As: np.ndarray):
         assert As.ndim == 3
         assert As.shape[1] == As.shape[2]
         if self.check_if_sym_input:
             assert np.all([np.allclose(A, A.T) for A in As])
         self.n_layers_, self.n_nodes_, _ = As.shape
 
-    def _make_train_test_layers(self, As, triu_test_masks: np.array):
+    def _make_train_test_layers(self, As, triu_test_masks: np.ndarray):
         triu_x, triu_y = np.triu_indices(self.n_nodes_, k=0 if self.loops_allowed else 1)
         triu_train_masks = ~triu_test_masks
         As_test = As.copy()
@@ -218,8 +218,8 @@ def mean_frobenius_error(As_true, As_pred, relative=True, include_offdiag=True):
                     for A_true, A in zip(As_true, As_pred)])
 
 
-def make_error_report(params_true: Union[List[np.array], Tuple[np.array]],
-                      params_pred: Union[List[np.array], Tuple[np.array]],
+def make_error_report(params_true: Union[List[np.ndarray], Tuple[np.ndarray]],
+                      params_pred: Union[List[np.ndarray], Tuple[np.ndarray]],
                       relative_errors: bool = True):
     assert len(params_true) == len(params_pred)
     errs = []
@@ -229,7 +229,7 @@ def make_error_report(params_true: Union[List[np.array], Tuple[np.array]],
     return errs
 
 
-def make_group_averages(As, group_indices, groups=None) -> np.array:
+def make_group_averages(As, group_indices, groups=None) -> np.ndarray:
     A_bars = []
     if groups is not None:
         assert set(groups).issubset(set(group_indices))
@@ -329,7 +329,7 @@ def estimate_sigma_mad(M):
     return sigma
 
 
-def if_scalar_or_given_length_array(val, length: int, name: str = None) -> np.array:
+def if_scalar_or_given_length_array(val, length: int, name: Optional[str] = None) -> np.ndarray:
     name = f'{val=}'.split('=')[0] if name is None else name
     if isinstance(val, (np.ndarray, list)):
         assert len(val) == length, \
@@ -342,7 +342,7 @@ def if_scalar_or_given_length_array(val, length: int, name: str = None) -> np.ar
     return val
 
 
-def fill_diagonals(As: Union[np.array, List[np.array]], val: float = 0, inplace: bool = True):
+def fill_diagonals(As: Union[np.ndarray, List[np.ndarray]], val: float = 0, inplace: bool = True):
     if not inplace:
         As = copy(As)
     for idx in range(len(As)):

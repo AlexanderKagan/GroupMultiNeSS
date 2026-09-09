@@ -3,7 +3,7 @@ from pathlib import Path
 this_directory = Path(__file__).parent
 LONG_DESCRIPTION = (this_directory / "README.md").read_text()
 
-VERSION = '0.0.5'
+VERSION = '0.0.6'
 DESCRIPTION = 'GroupMultiNeSS package'
 
 setup(
@@ -15,6 +15,7 @@ setup(
     long_description_content_type="text/markdown",
     long_description=LONG_DESCRIPTION,
     packages=find_packages(),
+    python_requires='<3.12',
     install_requires=["numpy<2",
                       "scipy",
                       "typing",
@@ -22,15 +23,13 @@ setup(
                       "matplotlib",
                       "seaborn",
                       "statsmodels",
-                      "scikit-learn",
-                      "more_itertools"],
+                      "scikit-learn"],
 
     keywords=['python', 'multiplex networks', 'multiness', 'latent space models'],
 
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Education",
-        "Programming Language :: Python :: 2",
         "Programming Language :: Python :: 3",
         "Operating System :: MacOS :: MacOS X",
         "Operating System :: Microsoft :: Windows",
