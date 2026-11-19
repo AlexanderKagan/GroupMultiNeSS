@@ -1,16 +1,16 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from typing import List, Dict, Optional, Union, Tuple
+from typing import List, Optional, Union
+from copy import deepcopy
 from collections import Counter
 from functools import partial
 from joblib import Parallel, delayed
 from warnings import warn
-from multiprocessing import Manager
+from contextlib import ExitStack, closing
 
 from .multiness import BaseMultiNeSS, BaseMultiNeSSRefined, BaseMultiNeSSRefinedCV, BaseOracleMultiNeSS
 from .base import BaseRefitting
 from .utils import if_scalar_or_given_length_array, fill_diagonals, \
-    soft_thresholding_operator, mean_frobenius_error
+    soft_thresholding_operator, hard_thresholding_operator, frobenius_error
 
 
 class BaseGroupMultiNeSS(BaseMultiNeSS):
@@ -24,7 +24,7 @@ class BaseGroupMultiNeSS(BaseMultiNeSS):
     group_indices : List[int]
         List of group assignments for each network layer.
     edge_distrib : str, default='normal'
-        Distribution of edges ('normal' or 'bernoulli').
+        Distribution of edges ('normal', 'bernoulli', or 'poisson').
     loops_allowed : bool, default=True
         Whether self-loops are allowed in the network.
     """
@@ -36,7 +36,7 @@ class BaseGroupMultiNeSS(BaseMultiNeSS):
         Initialize BaseGroupMultiNeSS with group assignments.
         """
         super().__init__(edge_distrib=edge_distrib, loops_allowed=loops_allowed)
-        self.group_indices = group_indices
+        self.group_indices = np.asarray(group_indices, dtype=int)
 
     def compute_latent_spaces(self):
         """
@@ -109,7 +109,7 @@ class BaseGroupMultiNeSS(BaseMultiNeSS):
         """
         return ["Shared component", "Group components", "Individual components"]
 
-    def _validate_input(self, As: List[np.ndarray]):
+    def _validate_input(self, As: Union[List[np.ndarray], np.ndarray]):
         """
         Validate input data and group assignments.
 
@@ -171,7 +171,7 @@ class BaseGroupMultiNeSSRefined(BaseGroupMultiNeSS, BaseMultiNeSSRefined):
         """
         BaseMultiNeSSRefined.__init__(self, edge_distrib=edge_distrib, loops_allowed=loops_allowed,
                                       max_rank=max_rank, init_rank=init_rank, sigmas=sigmas)
-        self.group_indices = group_indices
+        self.group_indices = np.asarray(group_indices, dtype=int)
         self.n_jobs = n_jobs
 
     @property
@@ -201,7 +201,7 @@ class BaseGroupMultiNeSSRefined(BaseGroupMultiNeSS, BaseMultiNeSSRefined):
             List of matrix indices for the group.
         """
         individs_within_group_indices = 1 + self.n_groups_ + np.arange(self.n_layers_)[self.group_indices == group]
-        return [1 + group, *individs_within_group_indices]
+        return [*individs_within_group_indices, 1 + group]
 
     def _get_param_participance_masks(self):
         """
@@ -218,406 +218,230 @@ class BaseGroupMultiNeSSRefined(BaseGroupMultiNeSS, BaseMultiNeSSRefined):
                          *np.eye(self.n_layers_, dtype=bool)])
 
     def _make_key_2_history_key_dict(self):
-        """
-        Map optimization keys to human-readable history keys.
-        """
-        self._key_2_history_key = {**{(0, group): f"Stage 1, Group {group}" for group in self.unique_groups_},
-                                   **{(1, 0): "Stage 2"}}
+        self._key_2_history_key = {0: 'Shared component', **{group + 1: f'GroupOptimize({group + 1})'
+                                           for group in self.unique_groups_}}
 
     def _make_key_2_param_indices_dict(self):
-        """
-        Map optimization keys to parameter indices.
-        """
-        self._key_2_param_indices = {**{(0, group): self._get_group_dependent_matrix_indices(group)
-                                        for group in self.unique_groups_},
-                                     **{(1, 0): list(range(1 + self.n_groups_))}}
+        self._key_2_param_indices = {0: [0], **{group + 1: self._get_group_dependent_matrix_indices(group)
+                                              for group in self.unique_groups_}}
 
-    def _fit(self, As, lr: Union[float, Tuple[float, float]] = 1., n_epochs: int = 1, reinit: bool = True,
-             **optim_kwargs):
-        """
-        Fit the model using two-stage optimization for groups and shared components.
+    def _optimized_params_init(self, As, key=0):
+        """Equation (13): truncate the group average before subtracting S."""
+        As = self._initialization_data(As)
+        shared = hard_thresholding_operator(np.nansum(As, axis=0) / self.n_layers_,
+                                           max_rank=self.init_rank)
+        self._set_matrix(shared, 0)
+        group_rank = None if self.init_rank is None else min(2 * self.init_rank, self.n_nodes_)
+        for group in self.unique_groups_:
+            mask = self.group_indices == group
+            group_average = hard_thresholding_operator(np.nansum(As[mask], axis=0) / mask.sum(),
+                                                        max_rank=group_rank)
+            self._set_matrix(group_average - shared, group + 1)
+            for layer in np.flatnonzero(mask):
+                residual = np.where(np.isnan(As[layer]), 0., As[layer] - group_average)
+                self._set_matrix(hard_thresholding_operator(residual, max_rank=self.init_rank),
+                                 self.n_groups_ + layer + 1)
 
-        Parameters
-        ----------
-        As : np.ndarray
-            Input adjacency matrices.
-        lr : float or tuple of float, default=1.
-            Learning rates for stage 1 and 2.
-        n_epochs : int, default=1
-            Number of epochs to run the optimization.
-        reinit : bool, default=True
-            Whether to reinitialize the parameters before each epoch.
-        """
-        self._pre_fit(n_epochs=n_epochs)
-        lrs = if_scalar_or_given_length_array(lr, length=2, name="lr")
-        for epoch in range(n_epochs):
-            # self._set_matrix(val=np.zeros((self.n_nodes_, self.n_nodes_)), idx=0)
-            Parallel(n_jobs=self.n_jobs)(
-                [delayed(self._optimize_params)(key=(0, group),
-                                                As=As, lr=lrs[0],
-                                                epoch=epoch,
-                                                reinit=(reinit and epoch == 0),
-                                                **optim_kwargs)
-                for group in self.unique_groups_])
-            # self._set_matrices(vals=np.zeros((self.n_groups_, self.n_nodes_, self.n_nodes_)), indices=np.arange(1, 1 + self.n_groups_))
-            self._optimize_params(key=(1, 0), As=As, lr=lrs[1],
-                                  epoch=epoch, 
-                                  reinit=(reinit and epoch == 0), 
-                                  **optim_kwargs)
+    def _run_optimization(self, As, lr=None, n_outer_iter=10, **optim_kwargs):
+        """Algorithm 1: independent group descents, then one shared update."""
+        lr = self._learning_rate(lr)
+        stable_iterations = 0
+        for outer_iter in range(n_outer_iter):
+            previous = self.get_shared_latent_space().copy()
+            # Threads share parameter storage and histories; groups write disjoint
+            # matrices and S stays fixed until all group descents have finished.
+            Parallel(n_jobs=self.n_jobs, require='sharedmem')(
+                delayed(self._optimize_params)(key=group + 1, As=As, lr=lr,
+                                               outer_iter=outer_iter, **optim_kwargs)
+                for group in self.unique_groups_)
+            self._optimization_step([0], key=0, As=As, lr=lr, iteration=0,
+                                    outer_iter=outer_iter, tol=optim_kwargs['tol'],
+                                    verbose=optim_kwargs.get('verbose', False) and
+                                    outer_iter % optim_kwargs.get('verbose_interval', 1) == 0,
+                                    save_latent_history=optim_kwargs.get('save_latent_history', False),
+                                    save_nll_history=optim_kwargs.get('save_nll_history', True))
+            change = frobenius_error(previous, self.get_shared_latent_space(), relative=True)
+            self.convergence_history_[outer_iter][0].append(change)
+            stable_iterations = stable_iterations + 1 if change <= optim_kwargs['tol'] else 0
+            self.n_outer_iter_ = outer_iter + 1
+            if stable_iterations >= optim_kwargs['patience']:
+                break
 
-    def get_error_history(self, *true_params, relative_errors=True):
-        """
-        Compute convergence error curves for S, Q_k, R_kl, concatenated across epochs.
+    def _error_components(self, key, true_params, estimates):
+        if key == 0:
+            return [(r'$S$', true_params[0], estimates[0])]
+        group = key - 1
+        mask = self.group_indices == group
+        return [(rf'$Q_{{{key}}}$', np.asarray(true_params[1])[group], estimates[1][group]),
+                (rf'$R_{{{key}\ell}}$', np.asarray(true_params[2])[mask], estimates[2][mask])]
 
-        Parameters
-        ----------
-        true_params : tuple (S_true, Q_true, R_true)
-            S_true : np.ndarray, shape (n_nodes, n_nodes)
-            Q_true : array-like, shape (n_groups, n_nodes, n_nodes) -- Q_true[k]
-            R_true : array-like, shape (n_layers, n_nodes, n_nodes) -- R_true[l]
-        relative_errors : bool, default=True
-            Whether to compute relative Frobenius errors.
-
-        Returns
-        -------
-        dict
-            Maps each key (stage, group) to a dict with:
-            - "series": dict of series_name -> 1d np.ndarray of errors, one value
-            per iteration, concatenated across all epochs in fit order.
-            Stage 0, group k: "$S+Q_k$" and "$R_{k\\ell}$".
-            Stage 1: "$S$", "$Q_k$" for every group k, and "$\\bar{Q}$" (average
-            error across groups).
-            - "epoch_ends": cumulative iteration counts at which each epoch stopped.
-        """
-        assert self.latent_history_, "Set save_latent_history == True during fit to access latent_history!"
-        S_true, Q_true, R_true = true_params
-        Q_true, R_true = np.asarray(Q_true), np.asarray(R_true)
-
-        err_hist = {}
-        for key, history_key in self._key_2_history_key.items():
-            stage, group = key
-            series, epoch_ends, cum_iter = {}, [], 0
-
-            for epoch_history in self.latent_history_:
-                snapshots = epoch_history[history_key]  # list over iterations of [S_hat, Q_hat, R_hat]
-                for S_hat, Q_hat, R_hat in snapshots:
-                    if stage == 0:
-                        layers_in_group = np.where(np.asarray(self.group_indices) == group)[0]
-                        err_SQ = mean_frobenius_error(S_true + Q_true[group], S_hat + Q_hat[group],
-                                                    relative=relative_errors, include_offdiag=self.loops_allowed)
-                        err_R = np.mean([mean_frobenius_error(R_true[l], R_hat[l], relative=relative_errors,
-                                                            include_offdiag=self.loops_allowed)
-                                        for l in layers_in_group])
-                        series.setdefault(rf"$S+Q_{{{group}}}$", []).append(err_SQ)
-                        series.setdefault(rf"$R_{{{group}\ell}}$", []).append(err_R)
-                    else:
-                        err_S = mean_frobenius_error(S_true, S_hat, relative=relative_errors,
-                                                    include_offdiag=self.loops_allowed)
-                        series.setdefault("$S$", []).append(err_S)
-                        series.setdefault(r"$Q$", []).append(
-                            mean_frobenius_error(Q_true, Q_hat, relative=relative_errors, include_offdiag=self.loops_allowed)
-                        )
-                cum_iter += len(snapshots)
-                epoch_ends.append(cum_iter)
-
-            err_hist[key] = {"series": {name: np.array(vals) for name, vals in series.items()},
-                            "epoch_ends": epoch_ends}
-        return err_hist
-
-
-    def plot_error_history(self, *true_params, relative_errors=True, n_cols: int = 4,
-                        fontsize=14, figsize=(12, 20), print_final_errors=True):
-        """
-        Plot convergence of S+Q_k / R_kl (stage 1, per group) and S / Q_k / mean Q
-        (stage 2), with all epochs drawn on the same continuous x-axis. Epoch
-        boundaries are marked with bracket-shaped underlines labeled "Epoch {n}"
-        below the plot, rather than a numeric tick axis.
-
-        Parameters
-        ----------
-        true_params : tuple (S_true, Q_true, R_true)
-            Ground-truth components, see `get_error_history`.
-        relative_errors : bool, default=True
-            Whether to plot relative Frobenius errors.
-        n_cols : int, default=4
-            Number of subplot columns.
-        fontsize : int, default=14
-            Font size for labels/titles.
-        figsize : tuple, default=(12, 20)
-            Figure size.
-        print_final_errors : bool, default=True
-            Whether to print the final-iteration errors for each subplot.
-        """
-        from matplotlib.transforms import blended_transform_factory
-
-        err_hist = self.get_error_history(*true_params, relative_errors=relative_errors)
-        keys = sorted(err_hist.keys())  # (0, 0) ... (0, K-1), (1, 0)
-
-        n_cols = min(n_cols, len(keys))
-        n_rows = int(np.ceil(len(keys) / n_cols))
-        fig, axs = plt.subplots(ncols=n_cols, nrows=n_rows, figsize=figsize)
-        axs = np.array(axs).flatten()
-
-        bracket_y = -0.10
-        tick_height = 0.025
-        label_y = bracket_y - 0.02
-
-        for ax, key in zip(axs, keys):
-            hist = err_hist[key]
-            for name, errs in hist["series"].items():
-                ax.plot(np.arange(1, len(errs) + 1), errs, label=name)
-
-            epoch_ends = hist["epoch_ends"]
-            epoch_starts = [0] + list(epoch_ends[:-1])
-            trans = blended_transform_factory(ax.transData, ax.transAxes)
-
-            for epoch_num, (start, end) in enumerate(zip(epoch_starts, epoch_ends), start=1):
-                ax.plot([start, end], [bracket_y, bracket_y], transform=trans,
-                        color='black', linewidth=1.5, clip_on=False)
-                ax.plot([start, start], [bracket_y, bracket_y + tick_height], transform=trans,
-                        color='black', linewidth=1.5, clip_on=False)
-                ax.plot([end, end], [bracket_y, bracket_y + tick_height], transform=trans,
-                        color='black', linewidth=1.5, clip_on=False)
-                ax.text((start + end) / 2, label_y, f"Epoch {epoch_num}", transform=trans,
-                        ha='center', va='top', fontsize=max(fontsize - 4, 8), clip_on=False)
-
-            ax.set_ylabel("Error", fontsize=fontsize)
-            ax.set_title(self._key_2_history_key[key], fontsize=fontsize)
-            ax.tick_params(axis='both', which='major', labelsize=fontsize)
-            ax.legend(fontsize=fontsize)
-
-        for idx in range(len(keys), n_cols * n_rows):
-            fig.delaxes(axs[idx])
-        plt.tight_layout()
-
-        if print_final_errors:
-            final_errs = {self._key_2_history_key[key]: {name: round(float(errs[-1]), 3)
-                                                        for name, errs in hist["series"].items()}
-                        for key, hist in err_hist.items()}
-            print("Final errors:", final_errs)
-        plt.show()
-                
 
 class GroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseRefitting):
-    """
-    Group-structured MultiNeSS model with refitting capability.
+    """GroupMultiNeSS with direct nuclear-norm penalties.
 
-    Parameters
-    ----------
-    group_indices : List[int]
-        List of group assignments for each network layer.
-    lmbda1, lmbda2 : float or array-like
-        Regularization parameters for stage 1 (group) and stage 2 (shared) components.
-    alpha1, alpha2 : float or array-like
-        Weighting parameters for stage 1 (group) and stage 2 (shared) components.
-    edge_distrib : str, default='normal'
-        Edge distribution.
-    max_rank, init_rank : int, optional
-        Maximum and initial ranks for low-rank components.
-    sigmas : float, list, or np.ndarray, optional
-        Noise standard deviation(s).
-    loops_allowed : bool, default=True
-        Whether self-loops are allowed.
-    n_jobs : int, optional
-        Number of parallel jobs for optimization.
-    refit_threshold : float, default=1e-8
-        Threshold for refitting components.
+    rho_0 penalizes S, rho_k penalizes each Q_k, and rho_kl penalizes each R_kl.
+    None defaults are 2*sqrt(M*n), 2*sqrt(m_k*n), and 2*sqrt(n), respectively.
+    rho_k and rho_kl accept scalars or sequences in group and input-layer order.
+    Group labels remain 0..K-1; optimization/history keys are 0 for S and 1..K
+    for group descents. init_rank=None leaves initialization untruncated.
     """
 
-    def __init__(self, group_indices: List[int],
-                 lmbda1: Optional[Union[float, np.ndarray, list]] = None,
-                 lmbda2: Optional[float] = None,
-                 alpha1: Optional[Union[float, np.ndarray, list]] = None,
-                 alpha2: Optional[Union[float, np.ndarray, list]] = None,
-                 edge_distrib: str = "normal",
-                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
-                 sigmas: Optional[Union[float, List[float], np.ndarray]] = None,
-                 loops_allowed: bool = True,
-                 n_jobs: Optional[int] = None,
-                 refit_threshold: float = 1e-8):
-        """
-        Initialize GroupMultiNeSS model.
-        """
+    def __init__(self, group_indices, rho_0=None, rho_k=None, rho_kl=None,
+                 edge_distrib='normal', max_rank=None, init_rank=None, sigmas=None,
+                 loops_allowed=True, n_jobs=None, refit_threshold=1e-8):
         BaseGroupMultiNeSSRefined.__init__(self, group_indices=group_indices, edge_distrib=edge_distrib,
                                            max_rank=max_rank, init_rank=init_rank, sigmas=sigmas,
                                            loops_allowed=loops_allowed, n_jobs=n_jobs)
-        BaseRefitting.__init__(self, edge_distrib=edge_distrib, max_rank=max_rank, loops_allowed=loops_allowed,
-                               refit_threshold=refit_threshold)
-        self.lmbda1 = lmbda1
-        self.lmbda2 = lmbda2
-        self.alpha1 = alpha1
-        self.alpha2 = alpha2
+        BaseRefitting.__init__(self, edge_distrib=edge_distrib, max_rank=max_rank,
+                               loops_allowed=loops_allowed, refit_threshold=refit_threshold)
+        self.rho_0 = rho_0
+        self.rho_k = rho_k
+        self.rho_kl = rho_kl
 
-    def _compute_projected_map(self, idx: int, lr, key: Tuple[int, int]):
-        """
-        Compute projected map for soft-thresholding operator.
-
-        Parameters
-        ----------
-        idx : int
-            Index of the parameter.
-        lr : float
-            Learning rate.
-        key : tuple
-            Optimization stage and group key.
-
-        Returns
-        -------
-        partial
-            Soft-thresholding operator with scaled threshold.
-        """
+    def _compute_projected_map(self, idx, lr, key):
         mask = self._param_participance_masks[idx]
         penalty = self._compute_penalty_coef(idx=idx, key=key)
         return partial(soft_thresholding_operator, threshold=penalty * lr / mask.sum(), max_rank=self.max_rank)
 
-    def _compute_penalty_coef(self, idx: int, key: Tuple[int, int]) -> float:
-        """
-        Compute penalty coefficient for a given parameter and stage.
-
-        Parameters
-        ----------
-        idx : int
-            Parameter index.
-        key : tuple
-            Stage and group key.
-
-        Returns
-        -------
-        float
-            Penalty coefficient.
-        """
-        hyperparam_dict = self._key_2_hyperparams_dict[key]
-        stage, group = key
-        lmbda, alpha = hyperparam_dict[f"lmbda{stage + 1}"], hyperparam_dict[f"alpha{stage + 1}"]
-        if stage == 0:
-            if idx == group + 1:
-                return lmbda
-            else:
-                idx_in_group = np.sum(self.group_indices[:idx - self.n_groups_ - 1] == group)
-                return lmbda * alpha[idx_in_group]
-        else:
-            return lmbda if idx == 0 else lmbda * alpha[idx - 1]
+    def _compute_penalty_coef(self, idx, key):
+        params = self._key_2_hyperparams_dict[key]
+        if idx == 0:
+            return params['rho_0']
+        if idx == key:
+            return params['rho_k']
+        layer = idx - self.n_groups_ - 1
+        idx_in_group = np.sum(self.group_indices[:layer] == key - 1)
+        return params['rho_kl'][idx_in_group]
 
     def _make_key_2_hyperparams_dict(self):
-        """
-        Create dictionary mapping optimization keys to hyperparameters.
-        """
-        if self.lmbda1 is None:
-            lmbda1 = 2. * np.sqrt(self.group_sizes_ * self.n_nodes_)
-        else:
-            lmbda1 = if_scalar_or_given_length_array(self.lmbda1, length=self.n_groups_, name="lmbda1")
-        lmbda2 = 2. * self.n_layers_ * np.sqrt(self.n_nodes_ / self.n_groups_) if self.lmbda2 is None else self.lmbda2
-        if self.alpha1 is None:
-            alpha1 = np.ones(self.n_layers_) / np.sqrt(self.group_sizes_[self.group_indices])
-        else:
-            alpha1 = if_scalar_or_given_length_array(self.alpha1, length=self.n_layers_, name="alpha1")
-        if self.alpha2 is None:
-            alpha2 = self.group_sizes_ / self.n_layers_ * np.sqrt(self.n_groups_)
-        else:
-            alpha2 = if_scalar_or_given_length_array(self.alpha2, length=self.n_groups_, name="alpha2")
+        rho_0 = 2. * np.sqrt(self.n_layers_ * self.n_nodes_) if self.rho_0 is None else self.rho_0
+        if not np.isscalar(rho_0):
+            raise ValueError('rho_0 must be a scalar')
+        rho_k = if_scalar_or_given_length_array(
+            2. * np.sqrt(self.group_sizes_ * self.n_nodes_) if self.rho_k is None else self.rho_k,
+            length=self.n_groups_, name='rho_k')
+        rho_kl = if_scalar_or_given_length_array(
+            2. * np.sqrt(self.n_nodes_) if self.rho_kl is None else self.rho_kl,
+            length=self.n_layers_, name='rho_kl')
+        self._validate_penalty(rho_0, 'rho_0')
+        self._validate_penalty(rho_k, 'rho_k')
+        self._validate_penalty(rho_kl, 'rho_kl')
+        self._key_2_hyperparams_dict = {0: {'rho_0': rho_0}, **{
+            group + 1: {'rho_k': rho_k[group], 'rho_kl': rho_kl[self.group_indices == group]}
+            for group in self.unique_groups_}}
 
-        self._key_2_hyperparams_dict = \
-            {**{(0, group): {"lmbda1": lmbda1[group], "alpha1": alpha1[self.group_indices == group]}
-                for group in self.unique_groups_},
-             **{(1, 0): {"lmbda2": lmbda2, "alpha2": alpha2}}}
-
-    def fit(self, As: List[np.ndarray],
-            lr: Union[float, Tuple[float, float]] = 1e-1,
-            max_iter: int = 100, tol=1e-5, patience=10,
-            refit=True, reinit=True,
-            n_epochs: int = 1,
-            verbose: bool = False, verbose_interval=1,
+    def fit(self, As, lr=None, max_iter=100, tol=1e-3, patience=10, refit=True,
+            n_outer_iter=10, verbose=False, verbose_interval=1,
             save_latent_history=False, save_nll_history=True):
-        """
-        Fit the GroupMultiNeSS model.
+        """Fit Algorithm 1, then jointly refit every nonzero parameter matrix.
 
-        Parameters
-        ----------
-        As : np.ndarray
-            Input adjacency matrices.
-        lr : float or tuple, default=0.1
-            Learning rate(s) for stages.
-        max_iter : int, default=100
-            Maximum number of iterations.
-        tol : float, default=1e-5
-            Convergence tolerance.
-        patience : int, default=10
-            Early stopping patience.
-        refit : bool, default=True
-            Whether to refit components.
-        n_epochs : int, default=1
-            Number of epochs to run the optimization.
-        reinit : bool, default=True
-            Whether to reinitialize the parameters
-        verbose : bool, default=False
-            Verbosity flag.
-        verbose_interval : int, default=1
-            Interval for printing verbose messages.
-        save_latent_history : bool, default=False
-            Whether to save latent history.
-        save_nll_history : bool, default=True
-            Whether to save NLL history.
-
-        Returns
-        -------
-        self
-            Fitted model instance.
+        max_iter limits each group descent; n_outer_iter defaults to 10 outer iterations.
+        tol and patience control consecutive small RFE changes in Q_k and S.
+        lr is a common scalar scale, divided once by each matrix's layer
+        participation count. Defaults are 1 for Gaussian/Poisson and 3 for Bernoulli.
+        All distributions use fixed steps without backtracking.
+        Each fit initializes all parameter matrices from the supplied data.
         """
-        As = self._validate_input(As=As)
-        self._fit(As, lr=lr, n_epochs=n_epochs,
-                  max_iter=max_iter, tol=tol, patience=patience,
-                  reinit=reinit, refit=False,
-                  verbose=verbose, verbose_interval=verbose_interval,
+        self._validate_optim_params(max_iter, tol, patience, verbose_interval, n_outer_iter)
+        lr = self._learning_rate(lr)
+        As = self._validate_input(As)
+        self._fit(As, lr=lr, n_outer_iter=n_outer_iter, max_iter=max_iter, tol=tol, patience=patience,
+                  refit=refit, verbose=verbose, verbose_interval=verbose_interval,
                   save_latent_history=save_latent_history, save_nll_history=save_nll_history)
-        
-        if refit:
-            self.refit(As, refit_matrix_indices=np.arange(self.n_fitted_matrices))
         return self
 
 
 class GroupMultiNeSSCV(GroupMultiNeSS, BaseMultiNeSSRefinedCV):
-    def __init__(self, group_indices: List[int],
-                 param_grid: Optional[Dict[str, List[float]]] = None,
-                 edge_distrib: str = "normal",
-                 lmbda1: Optional[Union[float, np.ndarray, list]] = None,
-                 lmbda2: Optional[float] = None,
-                 alpha1: Optional[Union[float, np.ndarray, list]] = None,
-                 alpha2: Optional[Union[float, np.ndarray, list]] = None,
-                 loops_allowed: bool = True,
-                 cv_folds: int = 3, test_prop: float = 0.1,
-                 max_rank: Optional[int] = None, init_rank: Optional[int] = None,
-                 sigmas: Optional[Union[float, List[float], np.ndarray]] = None,
-                 n_jobs: Optional[int] = None,
-                 refit_threshold=1e-8,
-                 fix_layer_split: bool = False,
-                 use_1se_rule: bool = False,
-                 random_seed: Optional[int] = None):
+    """GroupMultiNeSS with shared or full first-outer-iteration edge CV.
 
-        BaseMultiNeSSRefinedCV.__init__(self, param_grid=param_grid, cv_folds=cv_folds, test_prop=test_prop,
-                                        loops_allowed=loops_allowed,
-                                        fix_layer_split=fix_layer_split,
-                                        use_1se_rule=use_1se_rule,
-                                        random_seed=random_seed)
+    param_grid accepts rho_0 and, for full CV, rho_k. A rho_k grid can be a
+    sequence used for every group, or a dict keyed by zero-based group labels.
+    Values are actual penalties; rho_kl is linked to rho_k/sqrt(m_k).
+    Default grids multiply each oracle rate by [0.03, 0.1, 0.3, 1, 3, 10].
+    """
 
-        GroupMultiNeSS.__init__(self, group_indices=group_indices,
-                                lmbda1=lmbda1, lmbda2=lmbda2, alpha1=alpha1, alpha2=alpha2, edge_distrib=edge_distrib,
-                                max_rank=max_rank, init_rank=init_rank, sigmas=sigmas,
-                                loops_allowed=loops_allowed, n_jobs=n_jobs,
-                                refit_threshold=refit_threshold)
+    def __init__(self, group_indices, param_grid=None, edge_distrib='normal',
+                 rho_0=None, rho_k=None, rho_kl=None, loops_allowed=True,
+                 cv_folds=3, test_prop=0.1, max_rank=None, init_rank=None,
+                 sigmas=None, n_jobs=None, refit_threshold=1e-8,
+                 fix_layer_split=False, use_1se_rule=False, random_seed=None, cv_type='shared'):
+        BaseMultiNeSSRefinedCV.__init__(self, param_grid=param_grid, cv_folds=cv_folds,
+                                        test_prop=test_prop, loops_allowed=loops_allowed,
+                                        fix_layer_split=fix_layer_split, use_1se_rule=use_1se_rule,
+                                        random_seed=random_seed, cv_type=cv_type)
+        GroupMultiNeSS.__init__(self, group_indices=group_indices, rho_0=rho_0, rho_k=rho_k,
+                                rho_kl=rho_kl, edge_distrib=edge_distrib, max_rank=max_rank,
+                                init_rank=init_rank, sigmas=sigmas, loops_allowed=loops_allowed,
+                                n_jobs=n_jobs, refit_threshold=refit_threshold)
 
-    def _make_key_2_hyperparams_grid_dict(self) -> None:
-        const_range = np.array([0.03, 0.1, 0.3, 1, 3, 10])
-        if self.param_grid is None:
-            self._key_2_hyperparams_grid = {
-                **{(1, 0): {"lmbda2": self.n_layers_ * np.sqrt(self.n_nodes_ / self.n_groups_) * const_range}},
-                **{(0, group): {"lmbda1": np.sqrt(self.n_nodes_ * self.group_sizes_[group]) * const_range}
-                   for group in self.unique_groups_}}
+    def _make_key_2_hyperparams_grid_dict(self):
+        allowed = {'rho_0', 'rho_k'} if self.cv_type == 'full' else {'rho_0'}
+        if self.param_grid is not None and set(self.param_grid) - allowed:
+            raise ValueError(f'{self.cv_type} CV param_grid only accepts {sorted(allowed)}')
+        BaseMultiNeSSRefinedCV._make_key_2_hyperparams_grid_dict(self)
+        if self.cv_type == 'full':
+            group_grid = None if self.param_grid is None else self.param_grid.get('rho_k')
+            if isinstance(group_grid, dict) and set(group_grid) - set(self.unique_groups_):
+                raise ValueError('rho_k grids must use existing zero-based group labels')
+            self._key_2_hyperparams_grid.update({group + 1: {'rho_k': self._penalty_grid(
+                'rho_k', np.sqrt(self.n_nodes_ * self.group_sizes_[group]), group=group)}
+                for group in self.unique_groups_})
+
+    def _set_cv_penalties(self, params, key):
+        self._set_hyperparams(params, key)
+        if key == 0 and self.cv_type == 'shared':
+            rho_0 = params['rho_0']
+            for group in self.unique_groups_:
+                self._key_2_hyperparams_dict[group + 1]['rho_k'] = (
+                    rho_0 * np.sqrt(self.group_sizes_[group] / self.n_layers_))
+                self._key_2_hyperparams_dict[group + 1]['rho_kl'] = np.full(
+                    self.group_sizes_[group], rho_0 / np.sqrt(self.n_layers_))
+        elif key > 0:
+            self._key_2_hyperparams_dict[key]['rho_kl'] = np.full(
+                self.group_sizes_[key - 1], params['rho_k'] / np.sqrt(self.group_sizes_[key - 1]))
+
+    def _cv_search(self, As, n_outer_iter, refit, optim_kwargs):
+        if self.cv_type == 'full':
+            self._cv_full(As, n_outer_iter, refit, optim_kwargs)
         else:
+            self._cv_shared(As, n_outer_iter, refit, optim_kwargs)
 
-            stage_2_grid = {stage: {key: grid for key, grid in self.param_grid.items() if key.endswith(str(stage + 1))}
-                            for stage in range(2)}
-            self._key_2_hyperparams_grid = {**{(0, group): stage_2_grid[0] for group in self.unique_groups_},
-                                            **{(1, 0): stage_2_grid[1]}}
+    def _cv_full(self, As, n_outer_iter, refit, optim_kwargs):
+        # Keep a fold's group fits with its own S initializer and edge mask. S CV
+        # uses these same training/test edges, never full-data group estimates.
+        folds = []
+        lr = self._learning_rate(optim_kwargs['lr'])
+        inner_kwargs = {**optim_kwargs, 'lr': lr}
+        with ExitStack() as stack:
+            for train, test in self._cv_splits(As):
+                candidate = stack.enter_context(closing(self._new_cv_model(train, n_outer_iter)))
+                initial = candidate.get_all_fitted_matrices().copy()
+                folds.append((candidate, train, test, initial))
+                for key in range(1, self.n_groups_ + 1):
+                    mask = candidate._param_participance_masks[key]
+                    for params in self._cv_results[key]:
+                        candidate._set_matrices(initial)
+                        candidate._set_cv_penalties({'rho_k': params[0]}, key)
+                        candidate._optimize_params(key=key, As=train, **inner_kwargs)
+                        self._cv_results[key][params].append(candidate._compute_nll(test, obs_mask=mask))
+            for key in range(1, self.n_groups_ + 1):
+                self._set_best_hyperparams(key)
+            for candidate, train, test, initial in folds:
+                candidate._set_matrices(initial)
+                candidate._key_2_hyperparams_dict = deepcopy(self._key_2_hyperparams_dict)
+                for key in range(1, self.n_groups_ + 1):
+                    candidate._optimize_params(key=key, As=train, **inner_kwargs)
+                group_fitted = candidate.get_all_fitted_matrices().copy()
+                for params in self._cv_results[0]:
+                    candidate._set_matrices(group_fitted)
+                    candidate._set_cv_penalties({'rho_0': params[0]}, 0)
+                    candidate._optimization_step([0], key=0, As=train, lr=lr, iteration=0,
+                                                 outer_iter=0, verbose=False, tol=optim_kwargs['tol'],
+                                                 save_latent_history=False, save_nll_history=False)
+                    if refit:
+                        candidate.refit(train)
+                    self._cv_results[0][params].append(candidate._compute_nll(test))
+            self._set_best_hyperparams(0)
 
 
 class OracleGroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseOracleMultiNeSS):
@@ -636,26 +460,20 @@ class OracleGroupMultiNeSS(BaseGroupMultiNeSSRefined, BaseOracleMultiNeSS):
         self.d_individs = d_individs
 
     def _make_key_2_hyperparams_dict(self):
-        d_shared = if_scalar_or_given_length_array(self.d_shared, length=1, name="d_shared")[0]
-        d_groups = if_scalar_or_given_length_array(self.d_groups, length=self.n_groups_, name="d_groups")
-        d_individs = if_scalar_or_given_length_array(self.d_individs, length=self.n_layers_, name="d_individs")
-        self._key_2_hyperparams_dict = {**{(0, group): {"d_shared": d_shared + d_groups[group],
-                                                        "d_individs": d_individs[self.group_indices == group]}
-                                        for group in self.unique_groups_},
-                                        **{(1, 0): {"d_shared": d_shared, "d_individs": d_groups}}}
+        d_shared = int(if_scalar_or_given_length_array(self.d_shared, length=1, name='d_shared')[0])
+        d_groups = if_scalar_or_given_length_array(self.d_groups, length=self.n_groups_, name='d_groups')
+        d_individs = if_scalar_or_given_length_array(self.d_individs, length=self.n_layers_, name='d_individs')
+        self._key_2_hyperparams_dict = {0: {'d_shared': d_shared}, **{
+            group + 1: {'d_group': int(d_groups[group]),
+                        'd_individs': d_individs[self.group_indices == group]}
+            for group in self.unique_groups_}}
 
-    def _compute_threshold_rank(self, idx: int, key: Tuple[int, int]) -> int:
-        hyperparam_dict = self._key_2_hyperparams_dict[key]
-        d_shared, d_individs = hyperparam_dict["d_shared"], hyperparam_dict["d_individs"]
-        stage, group = key
+    def _compute_threshold_rank(self, idx, key):
+        params = self._key_2_hyperparams_dict[key]
         if idx == 0:
-            max_rank = d_shared
-        elif 1 <= idx < self.n_groups_ + 1:
-            if stage == 0:
-                max_rank = d_shared
-            else:
-                max_rank = d_individs[idx - 1]
-        else:
-            idx_in_group = np.sum(self.group_indices[:idx - self.n_groups_ - 1] == group)
-            max_rank = d_individs[idx_in_group]
-        return max_rank
+            return params['d_shared']
+        if idx == key:
+            return params['d_group']
+        layer = idx - self.n_groups_ - 1
+        idx_in_group = np.sum(self.group_indices[:layer] == key - 1)
+        return int(params['d_individs'][idx_in_group])

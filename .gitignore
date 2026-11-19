@@ -209,3 +209,4 @@ __marimo__/
 .idea
 use_example.ipynb
 group_multiness_ablations.ipynb
+tests

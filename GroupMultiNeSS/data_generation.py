@@ -10,7 +10,7 @@ class LatentPositionGenerator:
     Generator of latent positions for MultiNeSS model.
 
     This class simulates multiple network layers that share a common latent component and
-    layer-specific deviations. It supports normal and Bernoulli edge generation models
+    layer-specific deviations. It supports normal, Bernoulli, and Poisson edge models
     and can impose angle constraints between latent spaces.
 
     Parameters
@@ -19,9 +19,10 @@ class LatentPositionGenerator:
         Number of nodes in each network layer.
     n_layers : int
         Number of network layers to generate.
-    edge_distrib : {'normal', 'bernoulli'}, default='normal'
+    edge_distrib : {'normal', 'bernoulli', 'poisson'}, default='normal'
         Type of edge distribution. If 'normal', edges are generated with Gaussian noise.
         If 'bernoulli', edges are drawn as Bernoulli random variables.
+        If 'poisson', counts are drawn with mean exp(latent parameter).
     noise_sigma : float, default=1.0
         Standard deviation of the Gaussian noise for normal-distributed edges.
     loops_allowed : bool, default=True
@@ -67,8 +68,10 @@ class LatentPositionGenerator:
             self.link_fun = lambda x: x
         elif self.edge_distrib == "bernoulli":
             self.link_fun = sigmoid
+        elif self.edge_distrib == 'poisson':
+            self.link_fun = np.exp
         else:
-            raise NotImplementedError("Link function should be normal or bernoulli")
+            raise NotImplementedError("Edge distribution should be normal, bernoulli, or poisson")
 
         if isinstance(self.d_individs, (list, np.ndarray)):
             assert len(self.d_individs) == self.n_layers, \
@@ -133,11 +136,15 @@ class LatentPositionGenerator:
             elif self.edge_distrib == "bernoulli":
                 A = (np.random.rand(self.n_nodes, self.n_nodes) <= P).astype(float)
                 A[triu_x, triu_y] = A[triu_y, triu_x]
+            elif self.edge_distrib == 'poisson':
+                A = np.random.poisson(P)
+                A[triu_x, triu_y] = A[triu_y, triu_x]
             else:
                 raise NotImplementedError()
 
             if not self.loops_allowed:
                 np.fill_diagonal(A, 0.)
+                np.fill_diagonal(P, 0.)
             As.append(A)
         self.As = np.stack(As)
 
@@ -154,7 +161,7 @@ class GroupLatentPositionGenerator(LatentPositionGenerator):
         Number of network layers to generate.
     group_indices : list of int
         Group index for each layer, specifying which group latent component applies.
-    edge_distrib : {'normal', 'bernoulli'}, default='normal'
+    edge_distrib : {'normal', 'bernoulli', 'poisson'}, default='normal'
         Type of edge distribution for generated networks.
     noise_sigma : float, default=1.0
         Standard deviation of Gaussian noise for normal-distributed edges.

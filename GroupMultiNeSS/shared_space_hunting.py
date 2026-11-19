@@ -295,7 +295,7 @@ class SharedSpaceHuntRefined(OracleMultiNeSS):
         """Placeholder for hyperparameter dictionary creation."""
         pass
 
-    def _optimized_params_init(self, As, key: Tuple[int, int]) -> None:
+    def _optimized_params_init(self, As, key: int = 0) -> None:
         """
         Initialize parameters using SharedSpaceHunt.
 
@@ -311,5 +311,5 @@ class SharedSpaceHuntRefined(OracleMultiNeSS):
         ssh.fit(As)
         self.d_shared_ = ssh.d_shared_
         self.d_individs_ = ssh.d_individs_
-        self._key_2_hyperparams_dict = {(0, 0): {"d_shared": self.d_shared_, "d_individs": self.d_individs_}}
+        self._key_2_hyperparams_dict = {0: {"d_shared": self.d_shared_, "d_individs": self.d_individs_}}
         self._set_matrices(ssh.get_all_fitted_matrices())

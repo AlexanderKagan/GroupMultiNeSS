@@ -47,8 +47,8 @@ class MultipleNetworkTrainTestSplitter:
     def _make_train_test_layers(self, As, triu_test_masks: np.ndarray):
         triu_x, triu_y = np.triu_indices(self.n_nodes_, k=0 if self.loops_allowed else 1)
         triu_train_masks = ~triu_test_masks
-        As_test = As.copy()
-        As_train = As.copy()
+        As_test = np.array(As, dtype=float, copy=True)
+        As_train = np.array(As, dtype=float, copy=True)
         for i, (test_mask, train_mask) in enumerate(zip(triu_test_masks, triu_train_masks)):
             test_triu_x, test_triu_y = triu_x[test_mask], triu_y[test_mask]
             train_triu_x, train_triu_y = triu_x[train_mask], triu_y[train_mask]
@@ -61,11 +61,11 @@ class MultipleNetworkTrainTestSplitter:
     def train_test_split(self, As, test_prop: float = 0.1):
         self._validate_input(As=As)
         triu_x, triu_y = np.triu_indices(self.n_nodes_, k=0 if self.loops_allowed else 1)
-        np.random.seed(self.random_seed)
+        rng = np.random.default_rng(self.random_seed)
         if self.fix_layer_split:
-            triu_test_masks = np.stack([np.random.rand(len(triu_x)) <= test_prop] * self.n_layers_)
+            triu_test_masks = np.stack([rng.random(len(triu_x)) <= test_prop] * self.n_layers_)
         else:
-            triu_test_masks = np.random.rand(self.n_layers_, len(triu_x)) <= test_prop
+            triu_test_masks = rng.random((self.n_layers_, len(triu_x))) <= test_prop
         return self._make_train_test_layers(As=As, triu_test_masks=triu_test_masks)
 
     def kfold_split(self, As, n_splits=5):
@@ -198,6 +198,9 @@ def soft_thresholding_operator(A, threshold, max_rank=None):
 
 
 def frobenius_error(A_true, A_pred, relative=False, include_offdiag=True):
+    """Frobenius error; relative error is zero for two zero matrices, else inf
+    when the reference norm is zero.
+    """
     assert A_true.shape == A_pred.shape
     assert A_true.ndim <= 2
     if include_offdiag or A_true.ndim == 1:
@@ -205,7 +208,45 @@ def frobenius_error(A_true, A_pred, relative=False, include_offdiag=True):
     else:
         mask = ~np.eye(A_true.shape[0], dtype=bool)
     abs_error = np.sqrt(np.sum((A_true - A_pred) ** 2, where=mask))
-    return abs_error / np.sqrt(np.sum(A_true ** 2,  where=mask)) if relative else abs_error
+    if not relative:
+        return abs_error
+    scale = np.sqrt(np.sum(A_true ** 2, where=mask))
+    if scale == 0:
+        return 0. if abs_error == 0 else np.inf
+    return abs_error / scale
+
+
+def mark_intervals_on_xaxis(ax, ends, fontsize=12, label='out_it', rotation=45):
+    """Mark consecutive intervals of one-based samples with spaced underbraces.
+
+    ends contains cumulative sample counts. Labels are numbered from one and
+    drawn below the x axis; call tight_layout afterwards to reserve space.
+    """
+    from matplotlib.path import Path
+    from matplotlib.patches import PathPatch
+    from matplotlib.transforms import blended_transform_factory
+
+    transform = blended_transform_factory(ax.transData, ax.transAxes)
+    label = label.replace('_', r'\_')
+    start = 0
+    for interval, end in enumerate(ends, start=1):
+        inset = min(0.6, 0.08 * (end - start))
+        left, right = start + 0.5 + inset, end + 0.5 - inset
+        mid, width = (left + right) / 2, right - left
+        y, depth = -0.16, 0.06
+        shoulder = y - depth / 2
+        vertices = [(left, y),
+                    (left, shoulder), (left+width*.06, shoulder), (mid-width*.08, shoulder),
+                    (mid-width*.02, shoulder), (mid-width*.02, y-depth), (mid, y-depth),
+                    (mid+width*.02, y-depth), (mid+width*.02, shoulder), (mid+width*.08, shoulder),
+                    (right-width*.06, shoulder), (right, shoulder), (right, y)]
+        codes = [Path.MOVETO] + [Path.CURVE4] * 12
+        ax.add_patch(PathPatch(Path(vertices, codes), transform=transform, fill=False,
+                               color='black', clip_on=False))
+        ax.text(mid, y-depth-.02, rf"$\mathrm{{{label}}}={interval}$",
+                transform=transform, ha='right', va='top', rotation_mode='anchor',
+                fontsize=max(fontsize-4, 8), rotation=rotation, clip_on=False)
+        start = end
 
 
 def mean_frobenius_error(As_true, As_pred, relative=True, include_offdiag=True):

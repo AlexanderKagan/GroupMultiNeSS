@@ -7,6 +7,7 @@ from warnings import warn
 from typing import Iterable
 from multiprocessing import shared_memory
 import statsmodels.api as sm
+from sklearn.linear_model import LinearRegression, LogisticRegression, PoissonRegressor
 
 from .utils import sigmoid, leading_left_eigenvectors
 
@@ -43,11 +44,26 @@ class SharedMemoryMatrixFitter:
         elif vals is not None:
             warn("shape argument is not used as vals argument is provided!")
 
-        shm = shared_memory.SharedMemory(create=True, size=np.prod(shape) * 8)
-        self._param_matrices_shm = shared_memory.SharedMemory(name=shm.name)
+        shape = tuple(shape)
+        self.close()
+        self._param_matrices_shm = shared_memory.SharedMemory(create=True, size=int(np.prod(shape)) * 8)
         self.param_matrices = np.ndarray(shape, dtype=np.float64, buffer=self._param_matrices_shm.buf)
         if vals is not None:
             self.param_matrices[:] = vals
+        else:
+            self.param_matrices.fill(0.)
+
+    def close(self):
+        """Release the shared-memory allocation, including temporary CV fits."""
+        shm = getattr(self, "_param_matrices_shm", None)
+        if shm is not None:
+            self.param_matrices = None
+            shm.close()
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            self._param_matrices_shm = None
 
     def _set_matrix(self, val, idx):
         """
@@ -89,6 +105,8 @@ class SharedMemoryMatrixFitter:
         np.ndarray
             Array backed by shared memory containing all parameter matrices.
         """
+        if self.param_matrices is None or self._param_matrices_shm is None:
+            raise RuntimeError("Parameter storage is closed; fit the model again before accessing it")
         return np.ndarray(self.param_matrices.shape, dtype=np.float64, buffer=self._param_matrices_shm.buf)
 
 
@@ -107,7 +125,7 @@ class BaseMultiplexNetworksModel(ABC):
         Parameters
         ----------
         edge_distrib : str, default='normal'
-            Type of edge distribution ('normal' or 'bernoulli').
+            Type of edge distribution ('normal', 'bernoulli', or 'poisson').
         loops_allowed : bool, default=True
             Whether self-loops are allowed in adjacency matrices.
         """
@@ -117,10 +135,12 @@ class BaseMultiplexNetworksModel(ABC):
             self.link_ = lambda x: x
         elif edge_distrib == "bernoulli":
             self.link_ = sigmoid
+        elif edge_distrib == "poisson":
+            self.link_ = np.exp
         else:
-            raise NotImplementedError("Edge distribution should be either normal or bernoulli!")
+            raise NotImplementedError("Edge distribution should be normal, bernoulli, or poisson!")
 
-    def _validate_input(self, As: List[np.ndarray]) -> np.ndarray:
+    def _validate_input(self, As: Union[List[np.ndarray], np.ndarray]) -> np.ndarray:
         """
         Validate input adjacency matrices.
 
@@ -147,7 +167,12 @@ class BaseMultiplexNetworksModel(ABC):
         self.n_nodes_ = As[0].shape[0]
         self.n_layers_ = len(As)
         self._param_participance_masks = self._get_param_participance_masks()
-        return np.stack(As)
+        As = np.stack(list(As))
+        if self.edge_distrib == 'poisson':
+            observed = As[~np.isnan(As)]
+            if np.any(~np.isfinite(observed)) or np.any(observed < 0) or np.any(observed != np.floor(observed)):
+                raise ValueError('Poisson edges must be nonnegative integer counts (or NaN for missing edges)')
+        return As
 
     @abstractmethod
     def _get_param_participance_masks(self) -> np.ndarray:
@@ -177,7 +202,7 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
         Parameters
         ----------
         edge_distrib : str, default="normal"
-            Type of edge distribution ('normal' or 'bernoulli').
+            Type of edge distribution ('normal', 'bernoulli', or 'poisson').
         max_rank : int, optional
             Maximum rank for eigenvector-based refitting.
         loops_allowed : bool, default=True
@@ -227,7 +252,7 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
     def _construct_refit_design_response_and_offset(self, As: np.ndarray, refit_matrix_indices: np.ndarray,
                                                     refit_matrix_eigvecs: List[np.ndarray]):
         """
-        Construct the design matrix, response vector, and offset for GLM refitting.
+        Construct the design matrix, response vector, and offset for refitting.
 
         Parameters
         ----------
@@ -241,7 +266,7 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
         Returns
         -------
         tuple of np.ndarray
-            Design matrix, response vector, and offset vector for GLM fitting.
+            Design matrix, response vector, and offset vector for regression.
         """
         triu_indices = np.triu_indices(self.n_nodes_, k=0 if self.loops_allowed else 1)
         obs_mask = self._param_participance_masks[refit_matrix_indices].any(0)
@@ -270,7 +295,7 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
         refit_matrix_eigvecs : list of np.ndarray
             Eigenvectors for each refit matrix.
         refit_matrix_eigvals : np.ndarray
-            Refitted eigenvalues from GLM.
+            Refitted eigenvalues from regression.
 
         Returns
         -------
@@ -309,9 +334,36 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
                                            refit_matrix_indices))  # don't refit rank zero matrices after hard-threshold
         return np.array(refit_matrix_indices, dtype=int)
 
+    def _fit_refit_coefficients(self, design_mat, response, offset, sample_weight=None):
+        """Unpenalized regression with no intercept, preserving optional offsets."""
+        if self.edge_distrib == 'normal':
+            # Subtracting the offset is exact for the identity link.
+            model = LinearRegression(fit_intercept=False)
+            return model.fit(design_mat, response - offset, sample_weight=sample_weight).coef_
+
+        # Scaling columns improves conditioning without changing the model space
+        # or the unpenalized likelihood; undo it on the fitted eigenvalues.
+        scale = np.sqrt(np.mean(design_mat ** 2, axis=0))
+        scale[scale == 0] = 1.
+        design = design_mat / scale
+        # LogisticRegression requires both response classes. A binomial GLM
+        # also accepts an all-zero/all-one response (e.g. a sparse CV fold).
+        if np.any(offset != 0) or (self.edge_distrib == 'bernoulli' and np.unique(response).size < 2):
+            family = sm.families.Poisson() if self.edge_distrib == 'poisson' else sm.families.Binomial()
+            return sm.GLM(response, design, family=family, offset=offset).fit().params / scale
+        if self.edge_distrib == 'poisson':
+            model = PoissonRegressor(alpha=0., fit_intercept=False, solver='lbfgs',
+                                     tol=1e-9, max_iter=1000)
+        else:
+            # Infinite C disables regularization without version-specific penalty
+            # spellings ('none', None, or the newer deprecated default).
+            model = LogisticRegression(C=np.inf, fit_intercept=False, solver='lbfgs',
+                                       tol=1e-9, max_iter=1000)
+        return model.fit(design, response).coef_.reshape(-1) / scale
+
     def refit(self, As: Union[List[np.ndarray], np.ndarray], refit_matrix_indices=None):
         """
-        Refit parameter matrices using GLM based on current adjacency matrices.
+        Jointly refit eigenvalues by unpenalized linear, logistic, or Poisson regression.
 
         Parameters
         ----------
@@ -324,17 +376,21 @@ class BaseRefitting(BaseMultiplexNetworksModel, SharedMemoryMatrixFitter):
         refit_matrix_indices = self._preprocess_refit_matrix_indices(refit_matrix_indices)
         if len(refit_matrix_indices) != 0:
 
-            refit_matrix_eigvecs = [leading_left_eigenvectors(mat, k=self.max_rank,
+            refit_matrix_eigvecs = [leading_left_eigenvectors(mat, k=self.n_nodes_ if self.max_rank is None else self.max_rank,
                                                               eigval_threshold=self.refit_threshold)
                                     for mat in self.get_all_fitted_matrices()[refit_matrix_indices]]
 
             design_mat, response, offset = self._construct_refit_design_response_and_offset(
                 As=As, refit_matrix_indices=refit_matrix_indices, refit_matrix_eigvecs=refit_matrix_eigvecs)
 
-            family = sm.families.Gaussian() if self.edge_distrib == "normal" else sm.families.Binomial()
-            refit_model = sm.GLM(response, design_mat, family=family, offset=offset)
-            result = refit_model.fit()
-            refit_matrix_eigvals = result.params
+            sample_weight = None
+            sigmas = getattr(self, 'sigmas_', None)
+            if self.edge_distrib == 'normal' and sigmas is not None:
+                obs_mask = self._param_participance_masks[refit_matrix_indices].any(0)
+                rows, cols = np.triu_indices(self.n_nodes_, k=0 if self.loops_allowed else 1)
+                observed = ~np.isnan(As[obs_mask][:, rows, cols].ravel())
+                sample_weight = (1. / sigmas[obs_mask][:, rows, cols].ravel() ** 2)[observed]
+            refit_matrix_eigvals = self._fit_refit_coefficients(design_mat, response, offset, sample_weight)
 
             refitted_matrices = self._construct_refitted_matrices(refit_matrix_eigvecs, refit_matrix_eigvals)
             self._set_matrices(refitted_matrices, indices=refit_matrix_indices)
